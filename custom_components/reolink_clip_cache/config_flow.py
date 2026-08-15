@@ -59,6 +59,7 @@ class ReolinkClipCacheConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """
         try:
             from homeassistant.components.media_source import async_browse_media
+
             result = await async_browse_media(self.hass, "media-source://reolink")
             if result is not None and result.children:
                 return True, ""
@@ -69,7 +70,6 @@ class ReolinkClipCacheConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return False, str(err)
 
     @staticmethod
-    @config_entries.HANDLERS.register(DOMAIN)
     def async_get_options_flow(
         config_entry: config_entries.ConfigEntry,
     ) -> ReolinkClipCacheOptionsFlow:
@@ -79,6 +79,10 @@ class ReolinkClipCacheConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 class ReolinkClipCacheOptionsFlow(config_entries.OptionsFlow):
     """Handle options flow for Reolink Clip Cache."""
+
+    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
+        """Initialize options flow."""
+        self.config_entry = config_entry
 
     async def async_step_init(
         self, user_input: dict | None = None
