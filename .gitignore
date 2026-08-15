@@ -1,0 +1,30 @@
+# https://www.gitignore.io/api/python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+__version__.py
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Home Assistant
+.storage/
+.HA_VERSION
+home-assistant.log*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dev
+*.pyc
+.cache/

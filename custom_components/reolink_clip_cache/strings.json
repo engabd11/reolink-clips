@@ -1,0 +1,41 @@
+{
+  "title": "Reolink Clip Cache",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up Reolink Clip Cache",
+        "description": "Cache event clips from your Reolink NVR for instant playback in Home Assistant.",
+        "data": {
+          "cache_days": "Days to keep cached clips (default: 7)",
+          "resolution": "Clip resolution to cache (low/sub/clear)"
+        }
+      },
+      "cameras": {
+        "title": "Configure Cameras",
+        "description": "Select which cameras and event types to cache.",
+        "data": {
+          "camera_name": "Camera name (must match Reolink media source exactly)",
+          "cache_person": "Cache Person events",
+          "cache_vehicle": "Cache Vehicle events",
+          "cache_animal": "Cache Animal events"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to Reolink media source",
+      "invalid_camera": "Camera name not found in Reolink media source"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Reolink Clip Cache Options",
+        "description": "Adjust cache settings and camera configuration.",
+        "data": {
+          "cache_days": "Days to keep cached clips",
+          "resolution": "Clip resolution to cache"
+        }
+      }
+    }
+  }
+}

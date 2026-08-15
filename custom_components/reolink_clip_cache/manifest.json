@@ -1,0 +1,11 @@
+{
+  "domain": "reolink_clip_cache",
+  "name": "Reolink Clip Cache",
+  "codeowners": ["@engabd11"],
+  "config_flow": true,
+  "documentation": "https://github.com/engabd11/reolink_clip_cache",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/engabd11/reolink_clip_cache/issues",
+  "requirements": [],
+  "version": "1.0.0"
+}
