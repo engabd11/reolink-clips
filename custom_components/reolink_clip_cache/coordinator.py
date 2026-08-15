@@ -630,17 +630,11 @@ class ReolinkClipCacheCoordinator:
                 "resolution": self.options.get("resolution", DEFAULT_RESOLUTION),
             })
 
-        self.hass.components.websocket_api.async_register_command(
-            WS_BROWSE, handle_browse
-        )
-        self.hass.components.websocket_api.async_register_command(
-            WS_RESOLVE, handle_resolve
-        )
-        self.hass.components.websocket_api.async_register_command(
-            WS_THUMBNAIL, handle_thumbnail
-        )
-        self.hass.components.websocket_api.async_register_command(
-            WS_STATUS, handle_status
-        )
+        from homeassistant.components.websocket_api import async_register_command
+
+        async_register_command(self.hass, WS_BROWSE, handle_browse)
+        async_register_command(self.hass, WS_RESOLVE, handle_resolve)
+        async_register_command(self.hass, WS_THUMBNAIL, handle_thumbnail)
+        async_register_command(self.hass, WS_STATUS, handle_status)
 
         _LOGGER.info("WebSocket API registered: browse, resolve, thumbnail, status")
