@@ -10,7 +10,6 @@ import asyncio
 import json
 import logging
 import os
-import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -78,7 +77,6 @@ class ReolinkClipCacheCoordinator:
         self._unsub_purge = None
 
         # Camera config from the integration options
-        # Maps camera name → {sensors, event_types}
         self._cameras: dict[str, dict] = {}
 
         # Store for persistence
@@ -104,7 +102,6 @@ class ReolinkClipCacheCoordinator:
         self._start_event_listeners()
 
         # Schedule periodic purge
-        cache_days = self.options.get("cache_days", DEFAULT_CACHE_DAYS)
         self._unsub_purge = async_track_time_interval(
             self.hass,
             self._async_purge_old_clips,
@@ -137,19 +134,26 @@ class ReolinkClipCacheCoordinator:
 
         _LOGGER.info("Reolink Clip Cache unloaded")
 
+    # ── Media Source Helpers ────────────────────────────────────────────
+
+    async def _browse_media(self, media_content_id: str):
+        """Browse media source using the proper HA import."""
+        from homeassistant.components.media_source import async_browse_media
+        return await async_browse_media(self.hass, media_content_id)
+
+    async def _resolve_media(self, media_content_id: str):
+        """Resolve media source using the proper HA import."""
+        from homeassistant.components.media_source import async_resolve_media
+        return await async_resolve_media(self.hass, media_content_id)
+
     # ── Camera Discovery ───────────────────────────────────────────────
 
     async def _discover_cameras(self) -> None:
         """Discover Reolink cameras and their detection sensors from HA entities.
 
         Maps binary_sensor entities to camera names based on naming patterns.
-        Your sensors follow these patterns:
-          - binary_sensor.back_door_person → camera "BACK DOOR"
-          - binary_sensor.reolink_duo_3_poe_person → camera "Carport"
-          - binary_sensor.doorbell_person → camera "Doorbell"
         """
         # Define known camera mappings based on your setup
-        # These map binary_sensor prefixes to the camera name used in Reolink media source
         known_cameras = {
             "back_door": {
                 "name": "BACK DOOR",
@@ -165,17 +169,12 @@ class ReolinkClipCacheCoordinator:
             },
         }
 
-        # Also allow override from integration options
-        custom_cameras = self.options.get("cameras", {})
-
         # Scan binary_sensor entities for Reolink detection sensors
         for state in self.hass.states.async_all("binary_sensor"):
             entity_id = state.entity_id
 
             for prefix, cam_config in known_cameras.items():
                 if entity_id.startswith(f"binary_sensor.{prefix}_"):
-                    # Extract event type from entity
-                    # e.g., binary_sensor.back_door_person → "Person"
                     suffix = entity_id.replace(f"binary_sensor.{prefix}_", "")
                     event_type = suffix.capitalize()
 
@@ -196,37 +195,23 @@ class ReolinkClipCacheCoordinator:
 
     def _start_event_listeners(self) -> None:
         """Register state change listeners for all detection sensors."""
+        from homeassistant.helpers.event import async_track_state_change_event
+
         for cam_name, cam_config in self._cameras.items():
             for event_type, entity_id in cam_config["sensors"].items():
                 if event_type not in CACHEABLE_EVENT_TYPES and event_type not in ["Visitor", "Package"]:
                     continue
 
                 async def _on_detection(event: Event, _cam=cam_name, _etype=event_type) -> None:
-                    await self._handle_detection(_cam, _etype)
+                    new_state = event.data.get("new_state")
+                    if new_state and new_state.state == "on":
+                        await self._handle_detection(_cam, _etype)
 
-                unsub = self.hass.bus.async_listen(
-                    f"state_changed",
-                    self._make_state_filter(entity_id, _on_detection),
+                unsub = async_track_state_change_event(
+                    self.hass, [entity_id], _on_detection
                 )
                 self._unsub_listeners.append(unsub)
                 _LOGGER.debug("Listening for %s on %s (%s)", event_type, cam_name, entity_id)
-
-    def _make_state_filter(self, entity_id: str, callback_fn):
-        """Create a bus listener that only fires for specific entity_id going to 'on'."""
-        @callback
-        def _filter(event: Event) -> None:
-            new_state = event.data.get("new_state")
-            old_state = event.data.get("old_state")
-            if (
-                new_state
-                and new_state.entity_id == entity_id
-                and new_state.state == "on"
-                and (not old_state or old_state.state != "on")
-            ):
-                # Fire the async callback
-                self.hass.async_create_task(callback_fn(event))
-
-        return _filter
 
     # ── Detection Handler ──────────────────────────────────────────────
 
@@ -254,15 +239,7 @@ class ReolinkClipCacheCoordinator:
     # ── Clip Download ──────────────────────────────────────────────────
 
     async def _download_clip(self, camera: str, event_type: str) -> None:
-        """Download a clip from the Reolink NVR via media_source API.
-
-        1. Browse to camera → resolution → today's date → event type
-        2. Get the most recent clip
-        3. Resolve the media URL
-        4. Download the file
-        5. Faststart it with ffmpeg
-        6. Save metadata JSON
-        """
+        """Download a clip from the Reolink NVR via media_source API."""
         resolution = self.options.get("resolution", DEFAULT_RESOLUTION)
         now = datetime.now()
         date_str = f"{now.year}/{now.month}/{now.day}"
@@ -277,9 +254,7 @@ class ReolinkClipCacheCoordinator:
                 return
 
             # Step 2: Resolve media URL
-            resolved = await self.hass.components.media_source.async_resolve_media(
-                self.hass, clip_info["media_content_id"]
-            )
+            resolved = await self._resolve_media(clip_info["media_content_id"])
             if not resolved or not resolved.url:
                 _LOGGER.warning("Could not resolve media URL for %s %s", camera, event_type)
                 return
@@ -369,9 +344,7 @@ class ReolinkClipCacheCoordinator:
         """
         try:
             # Browse root
-            root = await self.hass.components.media_source.async_browse_media(
-                self.hass, REOLINK_MEDIA_PREFIX
-            )
+            root = await self._browse_media(REOLINK_MEDIA_PREFIX)
             if not root or not root.children:
                 return None
 
@@ -383,50 +356,50 @@ class ReolinkClipCacheCoordinator:
                     cam_folder = child
                     break
             if not cam_folder:
+                _LOGGER.debug("Camera folder not found: %s", camera)
                 return None
 
             # Browse camera → find resolution folder
-            cam_result = await self.hass.components.media_source.async_browse_media(
-                self.hass, cam_folder.media_content_id
-            )
+            cam_result = await self._browse_media(cam_folder.media_content_id)
             res_folder = None
             for child in cam_result.children:
                 if resolution.lower() in child.title.lower():
                     res_folder = child
                     break
             if not res_folder:
+                _LOGGER.debug("Resolution folder not found: %s", resolution)
                 return None
 
             # Browse resolution → find date folder
-            res_result = await self.hass.components.media_source.async_browse_media(
-                self.hass, res_folder.media_content_id
-            )
+            res_result = await self._browse_media(res_folder.media_content_id)
             date_folder = None
             for child in res_result.children:
                 if date_str in child.title:
                     date_folder = child
                     break
             if not date_folder:
+                _LOGGER.debug("Date folder not found: %s", date_str)
                 return None
 
             # Browse date → find event type folder
-            date_result = await self.hass.components.media_source.async_browse_media(
-                self.hass, date_folder.media_content_id
-            )
+            date_result = await self._browse_media(date_folder.media_content_id)
             event_folder = None
             for child in date_result.children:
                 if child.title.lower() == event_type.lower():
                     event_folder = child
                     break
             if not event_folder:
+                _LOGGER.debug("Event folder not found: %s", event_type)
                 return None
 
             # Browse event type → get clips
-            event_result = await self.hass.components.media_source.async_browse_media(
-                self.hass, event_folder.media_content_id
-            )
-            clips = [c for c in (event_result.children or []) if c.can_play or c.media_content_type == "video/mp4"]
+            event_result = await self._browse_media(event_folder.media_content_id)
+            clips = [
+                c for c in (event_result.children or [])
+                if c.can_play or c.media_content_type == "video/mp4"
+            ]
             if not clips:
+                _LOGGER.debug("No clips found for %s %s", camera, event_type)
                 return None
 
             # Return the most recent clip (sorted by title descending = newest first)
@@ -439,8 +412,6 @@ class ReolinkClipCacheCoordinator:
 
     async def _faststart_clip(self, clip_path: Path) -> None:
         """Run ffmpeg -moov_to_start to move MP4 index to front for instant playback."""
-        import subprocess
-
         tmp_path = clip_path.with_suffix(".tmp.mp4")
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -477,9 +448,7 @@ class ReolinkClipCacheCoordinator:
             return False
 
         for f in self._cache_dir.glob(f"{prefix}*.mp4"):
-            # Parse timestamp from filename
             try:
-                # Format: back_door_person_20260815_143252.mp4
                 ts_str = f.stem.replace(prefix, "")
                 ts = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
                 if (now - ts).total_seconds() < threshold_seconds:
@@ -551,13 +520,11 @@ class ReolinkClipCacheCoordinator:
                 meta = json.loads(meta_file.read_text())
                 ts = datetime.fromisoformat(meta["timestamp"])
                 if ts < cutoff:
-                    # Delete both meta and clip
                     clip_file = self._cache_dir / meta["filename"]
                     clip_file.unlink(missing_ok=True)
                     meta_file.unlink()
                     purged += 1
             except Exception:
-                # If we can't parse it, leave it
                 pass
 
         if purged > 0:
@@ -578,19 +545,13 @@ class ReolinkClipCacheCoordinator:
         """Register WebSocket commands for the card to query cached clips."""
 
         async def handle_browse(hass: HomeAssistant, connection, msg):
-            """Return cached clips for a given camera and optional date/event_type filter.
-
-            Message format:
-              {type: "reolink_clip_cache/browse", camera: "BACK DOOR",
-               date?: "2026/8/15", event_type?: "Person"}
-            """
+            """Return cached clips for a given camera and optional date/event_type filter."""
             camera = msg.get("camera", "")
             date_filter = msg.get("date")
             event_filter = msg.get("event_type")
 
             clips = []
 
-            # If no specific camera, return all
             cameras = [camera] if camera else list(self._index.keys())
 
             for cam in cameras:
@@ -602,7 +563,6 @@ class ReolinkClipCacheCoordinator:
                     for clip in date_clips:
                         if event_filter and clip.get("event_type", "").lower() != event_filter.lower():
                             continue
-                        # Build URL for local serving
                         local_url = f"/local/{CACHE_DIR_NAME}/{clip['filename']}"
                         clips.append({
                             **clip,
@@ -610,16 +570,11 @@ class ReolinkClipCacheCoordinator:
                             "cached": True,
                         })
 
-            # Sort by timestamp descending (newest first)
             clips.sort(key=lambda c: c.get("timestamp", ""), reverse=True)
             connection.send_result(msg["id"], {"clips": clips, "total": len(clips)})
 
         async def handle_resolve(hass: HomeAssistant, connection, msg):
-            """Resolve a cached clip's local URL.
-
-            Message format:
-              {type: "reolink_clip_cache/resolve", filename: "back_door_person_20260815_143252.mp4"}
-            """
+            """Resolve a cached clip's local URL."""
             filename = msg.get("filename", "")
             clip_path = self._cache_dir / filename
 
@@ -641,11 +596,7 @@ class ReolinkClipCacheCoordinator:
                 connection.send_result(msg["id"], {"cached": False, "url": None})
 
         async def handle_thumbnail(hass: HomeAssistant, connection, msg):
-            """Return thumbnail URL for a cached clip (if available).
-
-            Message format:
-              {type: "reolink_clip_cache/thumbnail", filename: "..."}
-            """
+            """Return thumbnail URL for a cached clip (if available)."""
             filename = msg.get("filename", "").replace(".mp4", ".jpg")
             thumb_path = self._cache_dir / filename
 

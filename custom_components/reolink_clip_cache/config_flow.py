@@ -8,7 +8,6 @@ from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResult
 
 from .const import (
-    CACHEABLE_EVENT_TYPES,
     DEFAULT_CACHE_DAYS,
     DEFAULT_RESOLUTION,
     DOMAIN,
@@ -28,7 +27,8 @@ class ReolinkClipCacheConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             # Validate that Reolink integration is available
-            if await self._validate_reolink():
+            valid, _ = await self._validate_reolink()
+            if valid:
                 return self.async_create_entry(
                     title="Reolink Clip Cache",
                     data={},
@@ -52,16 +52,21 @@ class ReolinkClipCacheConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
-    async def _validate_reolink(self) -> bool:
-        """Check that Reolink integration is configured and media source works."""
-        # Verify Reolink media source is accessible
+    async def _validate_reolink(self) -> tuple[bool, str]:
+        """Check that Reolink integration is configured and media source works.
+
+        Returns (success, error_message).
+        """
         try:
-            result = await self.hass.components.media_source.async_browse_media(
-                self.hass, "media-source://reolink"
-            )
-            return result is not None
-        except Exception:
-            return False
+            from homeassistant.components.media_source import async_browse_media
+            result = await async_browse_media(self.hass, "media-source://reolink")
+            if result is not None and result.children:
+                return True, ""
+            return False, "No Reolink devices found in media source"
+        except ImportError:
+            return False, "media_source integration not available"
+        except Exception as err:
+            return False, str(err)
 
     @staticmethod
     @config_entries.HANDLERS.register(DOMAIN)
