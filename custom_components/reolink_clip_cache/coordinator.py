@@ -21,6 +21,8 @@ from datetime import date as dt_date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from aiohttp import ClientError
+
 from homeassistant.components.http.auth import async_sign_path
 from homeassistant.components.media_source import (
     async_browse_media,
@@ -42,20 +44,21 @@ from homeassistant.util import dt as dt_util, slugify
 
 from .const import (
     CACHEABLE_TRIGGERS,
-    CLIP_URL,
     CLIPS_DIR_NAME,
+    CLIP_URL,
     CONF_CACHE_DAYS,
     CONF_CAMERAS,
-    CONSECUTIVE_FAILURE_LIMIT,
     CONF_EVENT_TYPES,
     CONF_MAX_CACHE_MB,
     CONF_STREAM,
     CONF_SWEEP_MINUTES,
+    CONSECUTIVE_FAILURE_LIMIT,
     DEFAULT_CACHE_DAYS,
     DEFAULT_EVENT_TYPES,
     DEFAULT_MAX_CACHE_MB,
     DEFAULT_STREAM,
     DEFAULT_SWEEP_MINUTES,
+    DIRECT_HEADERS,
     DOWNLOAD_ATTEMPTS,
     DOWNLOAD_CHUNK_SIZE,
     DOWNLOAD_HEADERS,
@@ -77,8 +80,8 @@ from .const import (
     STORAGE_VERSION,
     STREAMS,
     SWEEP_COOLDOWN,
-    THUMB_URL,
     THUMBS_DIR_NAME,
+    THUMB_URL,
     TRIGGER_ALIASES,
 )
 
@@ -727,9 +730,7 @@ class ReolinkClipCacheCoordinator:
                 clip_path = self.clip_path(clip_id)
                 part_path = clip_path.with_suffix(".part")
 
-                if not await self._async_download_with_retries(
-                    descriptor["media_content_id"], part_path
-                ):
+                if not await self._async_download_with_retries(descriptor, part_path):
                     await self.hass.async_add_executor_job(_unlink, part_path)
                     return False
 
@@ -799,22 +800,74 @@ class ReolinkClipCacheCoordinator:
             self._base_url = f"{scheme}://127.0.0.1:{self.hass.http.server_port}"
         return self._base_url
 
-    async def _async_download_with_retries(
-        self, media_content_id: str, dest: Path
-    ) -> int:
-        """Fetch a clip, retrying when the NVR drops the connection.
+    async def _async_direct_source(self, descriptor: dict[str, Any]) -> str | None:
+        """Ask the Reolink integration for the NVR's own URL for a clip.
 
-        Reolink NVRs serve a limited number of playback sessions and hang up
-        when busy, which surfaces as "Server disconnected" from the playback
-        proxy. Backing off and asking again is usually enough; anything still
-        failing is left for a later sweep.
+        This mirrors what Home Assistant's playback proxy does internally.
+        Returns None whenever the Reolink integration is not importable, the
+        recording is only offered as a live stream, or anything else does not
+        line up - the proxy remains as the fallback.
+        """
+        parts = bare_identifier(descriptor["media_content_id"]).split("|", 6)
+        if len(parts) != 7 or parts[0] != "FILE":
+            return None
+        _, entry_id, channel, stream, filename, start_id, end_id = parts
+
+        try:
+            from homeassistant.components.reolink.util import get_host
+            from reolink_aio.enums import VodRequestType
+
+            api = get_host(self.hass, entry_id).api
+
+            if filename.endswith((".mp4", ".vref")) or api.is_hub:
+                request_type = (
+                    VodRequestType.DOWNLOAD if api.is_nvr else VodRequestType.PLAYBACK
+                )
+            elif api.is_nvr:
+                # This form asks the NVR to prepare the recording first.
+                request_type = VodRequestType.NVR_DOWNLOAD
+                filename = f"{start_id}_{end_id}"
+            else:
+                # Anything else is only available as a live stream.
+                return None
+
+            _mime, url = await api.get_vod_source(
+                int(channel), filename, stream, request_type
+            )
+        except Exception as err:  # noqa: BLE001 - must never break caching
+            _LOGGER.debug(
+                "No direct NVR URL for this clip (%s): %s", type(err).__name__, err
+            )
+            return None
+
+        return url if url.startswith(("http://", "https://")) else None
+
+    async def _async_download_with_retries(
+        self, descriptor: dict[str, Any], dest: Path
+    ) -> int:
+        """Fetch a clip, trying the NVR directly before Home Assistant's proxy.
+
+        The proxy hands our request straight to the NVR over a pooled
+        connection with a five second read timeout, which is where "Server
+        disconnected" comes from. Fetching the NVR's own URL ourselves removes
+        that hop, refuses connection reuse and allows a longer read window.
         """
         for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
-            source = await self._async_source_url(media_content_id)
-            if source is None:
-                return 0
+            if direct := await self._async_direct_source(descriptor):
+                written = await self._async_download(
+                    direct, dest, headers=DIRECT_HEADERS, label="the NVR directly"
+                )
+                if written:
+                    return written
+                await self.hass.async_add_executor_job(_unlink, dest)
 
-            if written := await self._async_download(source, dest):
+            source = await self._async_source_url(descriptor["media_content_id"])
+            if source is None:
+                if not direct:
+                    return 0
+            elif written := await self._async_download(
+                source, dest, label="the Home Assistant proxy"
+            ):
                 return written
 
             await self.hass.async_add_executor_job(_unlink, dest)
@@ -839,13 +892,21 @@ class ReolinkClipCacheCoordinator:
         )
         return 0
 
-    async def _async_download(self, url: str, dest: Path) -> int:
+    async def _async_download(
+        self,
+        url: str,
+        dest: Path,
+        headers: dict[str, str] | None = None,
+        label: str = "the Home Assistant proxy",
+    ) -> int:
         """Stream a URL to disk. Returns the number of bytes written."""
         session = async_get_clientsession(self.hass, verify_ssl=False)
         written = 0
         try:
             async with asyncio.timeout(DOWNLOAD_TIMEOUT):
-                async with session.get(url, headers=DOWNLOAD_HEADERS) as response:
+                async with session.get(
+                    url, headers=headers or DOWNLOAD_HEADERS
+                ) as response:
                     if response.status not in OK_STATUSES:
                         # The Reolink proxy explains itself in the body; without
                         # this the failure is just a bare status code.
@@ -854,7 +915,8 @@ class ReolinkClipCacheCoordinator:
                         except Exception:  # noqa: BLE001
                             detail = "<unreadable body>"
                         _LOGGER.warning(
-                            "Clip download failed: HTTP %s (%s) - %s",
+                            "Clip download from %s failed: HTTP %s (%s) - %s",
+                            label,
                             response.status,
                             response.content_type,
                             detail or "<empty body>",
@@ -870,7 +932,16 @@ class ReolinkClipCacheCoordinator:
                     finally:
                         await self.hass.async_add_executor_job(handle.close)
         except TimeoutError:
-            _LOGGER.warning("Clip download timed out after %ss", DOWNLOAD_TIMEOUT)
+            _LOGGER.warning(
+                "Clip download from %s timed out after %ss", label, DOWNLOAD_TIMEOUT
+            )
+            return 0
+        except ClientError as err:
+            # Naming the exception type matters: a dropped connection, a
+            # refused one and a bad response all read alike without it.
+            _LOGGER.warning(
+                "Clip download from %s failed: %s: %s", label, type(err).__name__, err
+            )
             return 0
         return written
 
