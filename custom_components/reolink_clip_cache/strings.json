@@ -6,6 +6,7 @@
         "title": "Set up Reolink Clip Cache",
         "description": "Cached clips are stored privately under your configuration folder and served over an authenticated URL, so they are never publicly readable.",
         "data": {
+          "cameras": "Cameras to cache",
           "event_types": "Event types to cache",
           "stream": "Stream to cache",
           "cache_days": "Keep clips for",
@@ -13,8 +14,9 @@
           "sweep_minutes": "Check for new clips every"
         },
         "data_description": {
+          "cameras": "Leave empty to cache every Reolink camera.",
           "event_types": "Motion is deliberately not offered: it fires far too often to be worth caching.",
-          "stream": "Low resolution is much smaller and caches faster. High resolution gives the best picture.",
+          "stream": "Low resolution is much smaller and caches faster. If every download fails, try the other one - some NVRs will not serve downloads for one of the streams.",
           "cache_days": "Clips older than this are deleted automatically.",
           "max_cache_size_mb": "Once the cache exceeds this, the oldest clips are removed first.",
           "sweep_minutes": "A detection also triggers a check shortly after the event ends."
@@ -35,6 +37,7 @@
         "title": "Reolink Clip Cache options",
         "description": "Changing these reloads the integration.",
         "data": {
+          "cameras": "Cameras to cache",
           "event_types": "Event types to cache",
           "stream": "Stream to cache",
           "cache_days": "Keep clips for",
@@ -42,30 +45,13 @@
           "sweep_minutes": "Check for new clips every"
         },
         "data_description": {
+          "cameras": "Leave empty to cache every Reolink camera.",
           "event_types": "Motion is deliberately not offered: it fires far too often to be worth caching.",
-          "stream": "Low resolution is much smaller and caches faster. High resolution gives the best picture.",
+          "stream": "Low resolution is much smaller and caches faster. If every download fails, try the other one - some NVRs will not serve downloads for one of the streams.",
           "cache_days": "Clips older than this are deleted automatically.",
           "max_cache_size_mb": "Once the cache exceeds this, the oldest clips are removed first.",
           "sweep_minutes": "A detection also triggers a check shortly after the event ends."
         }
-      }
-    }
-  },
-  "selector": {
-    "event_types": {
-      "options": {
-        "person": "Person",
-        "vehicle": "Vehicle",
-        "animal": "Animal",
-        "package": "Package",
-        "visitor": "Visitor",
-        "face": "Face"
-      }
-    },
-    "stream": {
-      "options": {
-        "sub": "Low resolution",
-        "main": "High resolution"
       }
     }
   },

@@ -100,8 +100,9 @@ autoplay: false                 # play the newest clip on load
 
 | Option | Default | Description |
 |---|---|---|
+| Cameras | all | Which cameras to cache. Leave empty for every discovered camera. |
 | Event types | Person, Vehicle, Animal | What to cache. Motion is not offered — it fires far too often to be worth caching. |
-| Stream | Low resolution | `sub` caches fast and small; `main` is the full-quality recording |
+| Stream | Low resolution | `sub` caches fast and small; `main` is the full-quality recording. **If every download fails, try the other one** — some NVRs will not serve downloads for one of the streams. |
 | Keep clips for | 7 days | Age limit |
 | Maximum cache size | 2048 MB | Size ceiling; oldest clips are evicted first |
 | Check for new clips every | 2 min | Sweep interval. A detection also triggers a check ~20 s after the event ends. |
@@ -169,6 +170,10 @@ logger:
   chosen event types actually appear as folders under the day in Media → Reolink.
 - **Clips play but slowly** — they are not cached yet. The `CACHED` badge and the green dot
   on a thumbnail tell you which clips are local.
+- **`Clip download failed: ... Server disconnected`** — the NVR hung up on Home Assistant.
+  Clips are retried with a backoff and picked up again on later sweeps. If it happens for
+  every clip, switch the stream option to the other resolution: some NVRs refuse to serve
+  downloads for one of them. Reducing how often the sweep runs also helps a busy NVR.
 
 ## Credits
 

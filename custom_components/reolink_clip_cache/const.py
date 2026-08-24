@@ -52,10 +52,22 @@ CONF_STREAM: Final = "stream"
 CONF_MAX_CACHE_MB: Final = "max_cache_size_mb"
 CONF_EVENT_TYPES: Final = "event_types"
 CONF_SWEEP_MINUTES: Final = "sweep_minutes"
+CONF_CAMERAS: Final = "cameras"
 
 DEFAULT_CACHE_DAYS: Final = 7
 DEFAULT_MAX_CACHE_MB: Final = 2048
 DEFAULT_SWEEP_MINUTES: Final = 2
+
+# Reolink NVRs drop connections when they are busy, so a clip that fails is
+# retried a few times with a widening gap before it is left for a later sweep.
+DOWNLOAD_ATTEMPTS: Final = 3
+DOWNLOAD_RETRY_BACKOFF: Final = (5, 20)
+
+# Breathing room between clips so a sweep does not hammer the NVR.
+DOWNLOAD_SPACING: Final = 2
+
+# Abandon a sweep once this many clips fail back to back.
+CONSECUTIVE_FAILURE_LIMIT: Final = 3
 
 # ── Timing ───────────────────────────────────────────────────────────────
 
