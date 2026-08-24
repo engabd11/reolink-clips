@@ -21,7 +21,7 @@ from datetime import date as dt_date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from homeassistant.components.http import async_sign_path
+from homeassistant.components.http.auth import async_sign_path
 from homeassistant.components.media_source import (
     async_browse_media,
     async_resolve_media,
