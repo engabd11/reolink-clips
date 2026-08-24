@@ -1,32 +1,117 @@
 """Constants for the Reolink Clip Cache integration."""
 
-DOMAIN = "reolink_clip_cache"
+from __future__ import annotations
 
-# Event types we cache (not motion)
-CACHEABLE_EVENT_TYPES = ["Person", "Vehicle", "Animal"]
+from datetime import timedelta
+from typing import Final
 
-# Default settings
-DEFAULT_CACHE_DAYS = 7
-DEFAULT_RESOLUTION = "low"
+from homeassistant.const import Platform
 
-# WebSocket commands
-WS_BROWSE = "reolink_clip_cache/browse"
-WS_RESOLVE = "reolink_clip_cache/resolve"
-WS_THUMBNAIL = "reolink_clip_cache/thumbnail"
-WS_STATUS = "reolink_clip_cache/status"
+DOMAIN: Final = "reolink_clip_cache"
+VERSION: Final = "2.0.0"
 
-# Custom events
-EVENT_CLIP_CACHED = f"{DOMAIN}_clip_cached"
+PLATFORMS: Final = [Platform.SENSOR]
 
-# Media source prefix
-REOLINK_MEDIA_PREFIX = "media-source://reolink"
+# ── Reolink integration interop ──────────────────────────────────────────
 
-# File naming pattern: {camera}_{event_type}_{timestamp}.mp4
-CLIP_FILENAME_PATTERN = "{camera}_{event_type}_{timestamp}.mp4"
-META_FILENAME_PATTERN = "{camera}_{event_type}_{timestamp}.json"
+REOLINK_DOMAIN: Final = "reolink"
+REOLINK_MEDIA_PREFIX: Final = "media-source://reolink"
 
-# Cache directory (under HA www for static file serving)
-CACHE_DIR_NAME = "reolink_cache"
+# Reolink binary_sensor entity description keys that represent a recorded
+# event we can cache. These are the trailing segment of the entity unique_id
+# (``{mac}_{channel}_{key}``) and also match the media-source EVE trigger name.
+CACHEABLE_TRIGGERS: Final = [
+    "person",
+    "vehicle",
+    "pet",
+    "animal",
+    "package",
+    "visitor",
+    "face",
+]
 
-# Platforms
-PLATFORMS = ["sensor"]
+# Triggers offered in the config flow, in display order.
+DEFAULT_EVENT_TYPES: Final = ["person", "vehicle", "pet", "animal"]
+
+# Reolink groups pets and animals under different keys depending on model and
+# HA version; both surface as the same thing to a user.
+TRIGGER_ALIASES: Final = {"pet": "animal", "dog_cat": "animal"}
+
+# ── Streams ──────────────────────────────────────────────────────────────
+
+# Media-source stream identifiers (the ``RES|entry|ch|<stream>`` segment).
+STREAM_SUB: Final = "sub"
+STREAM_MAIN: Final = "main"
+STREAMS: Final = [STREAM_SUB, STREAM_MAIN]
+DEFAULT_STREAM: Final = STREAM_SUB
+
+# ── Options ──────────────────────────────────────────────────────────────
+
+CONF_CACHE_DAYS: Final = "cache_days"
+CONF_STREAM: Final = "stream"
+CONF_MAX_CACHE_MB: Final = "max_cache_size_mb"
+CONF_EVENT_TYPES: Final = "event_types"
+CONF_SWEEP_MINUTES: Final = "sweep_minutes"
+
+DEFAULT_CACHE_DAYS: Final = 7
+DEFAULT_MAX_CACHE_MB: Final = 2048
+DEFAULT_SWEEP_MINUTES: Final = 2
+
+# ── Timing ───────────────────────────────────────────────────────────────
+
+# Delay after a detection sensor clears before sweeping for the new clip. The
+# NVR only finalises the recording once the event has ended.
+EVENT_SETTLE_DELAY: Final = 20
+
+# Never sweep the same camera more often than this, however many events fire.
+SWEEP_COOLDOWN: Final = timedelta(seconds=15)
+
+MAX_CONCURRENT_DOWNLOADS: Final = 2
+
+# Cap the work one sweep takes on. Descriptors are newest-first, so a large
+# backfill still caches the most recent clips first and finishes over a few
+# sweeps instead of blocking everything else for minutes.
+MAX_CLIPS_PER_SWEEP: Final = 25
+DOWNLOAD_CHUNK_SIZE: Final = 64 * 1024
+DOWNLOAD_TIMEOUT: Final = 180
+FFMPEG_TIMEOUT: Final = 60
+
+# How long a signed clip URL handed to the card stays valid.
+SIGNED_URL_TTL: Final = 1800
+
+# ── Storage ──────────────────────────────────────────────────────────────
+
+STORAGE_DIR_NAME: Final = "reolink_clip_cache"
+CLIPS_DIR_NAME: Final = "clips"
+THUMBS_DIR_NAME: Final = "thumbs"
+
+STORAGE_KEY: Final = f"{DOMAIN}.index"
+STORAGE_VERSION: Final = 2
+
+# ── HTTP ─────────────────────────────────────────────────────────────────
+
+URL_BASE: Final = f"/api/{DOMAIN}"
+CLIP_URL: Final = f"{URL_BASE}/clip"
+THUMB_URL: Final = f"{URL_BASE}/thumb"
+
+CARD_FILENAME: Final = "reolink-clips-card.js"
+CARD_URL: Final = f"/{DOMAIN}/{CARD_FILENAME}"
+
+# ── WebSocket commands ───────────────────────────────────────────────────
+
+WS_CAMERAS: Final = f"{DOMAIN}/cameras"
+WS_DATES: Final = f"{DOMAIN}/dates"
+WS_CLIPS: Final = f"{DOMAIN}/clips"
+WS_RESOLVE: Final = f"{DOMAIN}/resolve"
+WS_STATUS: Final = f"{DOMAIN}/status"
+
+# ── Events / signals ─────────────────────────────────────────────────────
+
+EVENT_CLIP_CACHED: Final = f"{DOMAIN}_clip_cached"
+SIGNAL_INDEX_UPDATED: Final = f"{DOMAIN}_index_updated"
+
+# ── Services ─────────────────────────────────────────────────────────────
+
+SERVICE_PURGE_CACHE: Final = "purge_cache"
+SERVICE_REFRESH_CACHE: Final = "refresh_cache"
+SERVICE_SWEEP_NOW: Final = "sweep_now"

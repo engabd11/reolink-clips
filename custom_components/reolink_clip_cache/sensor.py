@@ -1,19 +1,60 @@
-"""Sensor platform for Reolink Clip Cache.
+"""Sensors exposing Reolink Clip Cache statistics.
 
-Provides a sensor showing cache statistics: total clips, disk usage, etc.
+Values come from the in-memory index and are pushed on the index-updated
+signal — nothing here touches the filesystem, because entity properties are
+read from the event loop.
 """
 
 from __future__ import annotations
 
-from homeassistant.components.sensor import SensorEntity, SensorEntityDescription
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfInformation
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
-from .const import DOMAIN
+from homeassistant.components.sensor import (
+    SensorEntity,
+    SensorEntityDescription,
+    SensorStateClass,
+)
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory, UnitOfInformation
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+
+from .const import DOMAIN, SIGNAL_INDEX_UPDATED
 from .coordinator import ReolinkClipCacheCoordinator
+
+
+@dataclass(frozen=True, kw_only=True)
+class ClipCacheSensorDescription(SensorEntityDescription):
+    """Describes a clip cache sensor."""
+
+    value_fn: Callable[[dict[str, Any]], float | int]
+
+
+SENSORS: tuple[ClipCacheSensorDescription, ...] = (
+    ClipCacheSensorDescription(
+        key="cache_size",
+        translation_key="cache_size",
+        icon="mdi:harddisk",
+        native_unit_of_measurement=UnitOfInformation.MEGABYTES,
+        suggested_display_precision=1,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda stats: stats["total_size_mb"],
+    ),
+    ClipCacheSensorDescription(
+        key="cached_clips",
+        translation_key="cached_clips",
+        icon="mdi:filmstrip-box-multiple",
+        native_unit_of_measurement="clips",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda stats: stats["total_clips"],
+    ),
+)
 
 
 async def async_setup_entry(
@@ -23,65 +64,64 @@ async def async_setup_entry(
 ) -> None:
     """Set up the sensor platform."""
     coordinator: ReolinkClipCacheCoordinator = hass.data[DOMAIN][entry.entry_id]
+    async_add_entities(
+        ClipCacheSensor(coordinator, entry, description) for description in SENSORS
+    )
 
-    async_add_entities([
-        ReolinkCacheStatsSensor(coordinator, entry),
-    ])
 
+class ClipCacheSensor(SensorEntity):
+    """A statistic about the local clip cache."""
 
-class ReolinkCacheStatsSensor(CoordinatorEntity, SensorEntity):
-    """Sensor that shows Reolink Clip Cache statistics."""
-
-    _attr_icon = "mdi:filmstrip-box"
-    _attr_native_unit_of_measurement = UnitOfInformation.MEGABYTES
     _attr_has_entity_name = True
+    _attr_should_poll = False
+
+    entity_description: ClipCacheSensorDescription
 
     def __init__(
         self,
         coordinator: ReolinkClipCacheCoordinator,
         entry: ConfigEntry,
+        description: ClipCacheSensorDescription,
     ) -> None:
-        """Initialize the sensor."""
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{entry.entry_id}_cache_stats"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, entry.entry_id)},
-            "name": "Reolink Clip Cache",
-            "manufacturer": "Reolink",
-            "model": "Clip Cache",
-        }
+        """Initialise the sensor."""
+        self.entity_description = description
         self._coordinator = coordinator
+        self._attr_unique_id = f"{entry.entry_id}_{description.key}"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name="Reolink Clip Cache",
+            manufacturer="Reolink",
+            model="Clip Cache",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to index changes."""
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass, SIGNAL_INDEX_UPDATED, self._handle_update
+            )
+        )
+
+    @callback
+    def _handle_update(self) -> None:
+        """Write the new state when the index changes."""
+        self.async_write_ha_state()
 
     @property
-    def name(self) -> str:
-        """Return the name of the sensor."""
-        return "Clip Cache Size"
+    def native_value(self) -> float | int:
+        """Return the sensor value."""
+        return self.entity_description.value_fn(self._coordinator.stats())
 
     @property
-    def native_value(self) -> float:
-        """Return the total cache size in MB."""
-        total_size = 0
-        if self._coordinator._cache_dir.exists():
-            for f in self._coordinator._cache_dir.glob("*.mp4"):
-                try:
-                    total_size += f.stat().st_size
-                except OSError:
-                    pass
-        return round(total_size / (1024 * 1024), 2)
-
-    @property
-    def extra_state_attributes(self) -> dict:
-        """Return additional state attributes."""
-        total_clips = 0
-        camera_stats = {}
-        for cam, dates in self._coordinator._index.items():
-            cam_clips = sum(len(v) for v in dates.values())
-            camera_stats[cam] = cam_clips
-            total_clips += cam_clips
-
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return the cache breakdown."""
+        stats = self._coordinator.stats()
         return {
-            "total_clips": total_clips,
-            "cameras": camera_stats,
-            "cache_days": self._coordinator.options.get("cache_days", 7),
-            "resolution": self._coordinator.options.get("resolution", "low"),
+            "cameras": stats["cameras"],
+            "cache_days": stats["cache_days"],
+            "max_cache_size_mb": stats["max_cache_size_mb"],
+            "stream": stats["stream"],
+            "event_types": stats["event_types"],
+            "storage_path": stats["storage_path"],
+            "last_clip": stats["last_clip"],
         }

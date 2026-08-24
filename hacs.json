@@ -1,8 +1,6 @@
 {
   "name": "Reolink Clip Cache",
   "content_in_root": false,
-  "filename": "reolink_clip_cache.zip",
-  "zip_directory": "custom_components/reolink_clip_cache",
-  "domains": ["reolink_clip_cache"],
-  "homeassistant": "2024.1.0"
+  "render_readme": true,
+  "homeassistant": "2024.11.0"
 }
