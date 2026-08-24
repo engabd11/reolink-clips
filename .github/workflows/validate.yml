@@ -37,6 +37,8 @@ jobs:
         run: pip install --quiet homeassistant
       - name: Import every module and check the config flow registers
         run: python scripts/check_imports.py
+      - name: Check media source id handling
+        run: python tests/test_media_source_ids.py
 
   syntax:
     name: Syntax
