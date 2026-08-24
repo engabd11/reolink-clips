@@ -20,7 +20,12 @@ import voluptuous as vol
 from homeassistant.components.frontend import add_extra_js_url
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import (
+    HomeAssistant,
+    ServiceCall,
+    ServiceResponse,
+    SupportsResponse,
+)
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.util import dt as dt_util
@@ -40,6 +45,7 @@ from .const import (
     DEFAULT_SWEEP_MINUTES,
     DOMAIN,
     PLATFORMS,
+    SERVICE_DIAGNOSE,
     SERVICE_PURGE_CACHE,
     SERVICE_REFRESH_CACHE,
     SERVICE_SWEEP_NOW,
@@ -134,6 +140,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         if not hass.data.get(DOMAIN):
             for service in (
+                SERVICE_DIAGNOSE,
                 SERVICE_PURGE_CACHE,
                 SERVICE_REFRESH_CACHE,
                 SERVICE_SWEEP_NOW,
@@ -193,6 +200,19 @@ def _async_register_services(hass: HomeAssistant) -> None:
             )
             _LOGGER.info("Manual sweep cached %d new clip(s)", cached)
 
+    async def diagnose(call: ServiceCall) -> ServiceResponse:
+        """Report what each download route does for one real clip."""
+        for coordinator in _coordinators():
+            return await coordinator.async_diagnose(call.data.get("camera"))
+        return {"error": "integration is not set up"}
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_DIAGNOSE,
+        diagnose,
+        schema=vol.Schema({vol.Optional("camera"): cv.string}),
+        supports_response=SupportsResponse.OPTIONAL,
+    )
     hass.services.async_register(DOMAIN, SERVICE_PURGE_CACHE, purge_cache)
     hass.services.async_register(DOMAIN, SERVICE_REFRESH_CACHE, refresh_cache)
     hass.services.async_register(

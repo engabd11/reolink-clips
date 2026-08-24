@@ -87,6 +87,16 @@
           "description": "How many days back to sweep, counting today."
         }
       }
+    },
+    "diagnose": {
+      "name": "Diagnose downloads",
+      "description": "Tries every download route against one real recording and reports what each one did. Use this when clips are found but never cache.",
+      "fields": {
+        "camera": {
+          "name": "Camera",
+          "description": "Camera key to test. Leave empty to test every camera."
+        }
+      }
     }
   }
 }
