@@ -45,6 +45,8 @@ from .const import (
     CLIP_URL,
     CLIPS_DIR_NAME,
     CONF_CACHE_DAYS,
+    CONF_CAMERAS,
+    CONSECUTIVE_FAILURE_LIMIT,
     CONF_EVENT_TYPES,
     CONF_MAX_CACHE_MB,
     CONF_STREAM,
@@ -54,8 +56,11 @@ from .const import (
     DEFAULT_MAX_CACHE_MB,
     DEFAULT_STREAM,
     DEFAULT_SWEEP_MINUTES,
+    DOWNLOAD_ATTEMPTS,
     DOWNLOAD_CHUNK_SIZE,
     DOWNLOAD_HEADERS,
+    DOWNLOAD_RETRY_BACKOFF,
+    DOWNLOAD_SPACING,
     DOWNLOAD_TIMEOUT,
     EVENT_CLIP_CACHED,
     EVENT_SETTLE_DELAY,
@@ -224,6 +229,11 @@ class ReolinkClipCacheCoordinator:
         return [normalise_trigger(item) for item in configured]
 
     @property
+    def selected_cameras(self) -> list[str]:
+        """Return the camera keys to cache, empty meaning every camera."""
+        return list(self.options.get(CONF_CAMERAS) or [])
+
+    @property
     def cache_days(self) -> int:
         """Return the retention window in days."""
         return int(self.options.get(CONF_CACHE_DAYS, DEFAULT_CACHE_DAYS))
@@ -370,6 +380,17 @@ class ReolinkClipCacheCoordinator:
 
                 camera.sensors[trigger] = entity.entity_id
 
+        if selected := self.selected_cameras:
+            missing = [key for key in selected if key not in cameras]
+            if missing:
+                _LOGGER.warning(
+                    "Configured camera(s) %s were not found in the media source; "
+                    "available cameras are %s",
+                    ", ".join(missing),
+                    ", ".join(sorted(cameras)) or "none",
+                )
+            cameras = {key: cam for key, cam in cameras.items() if key in selected}
+
         self._cameras = cameras
         self._restart_listeners()
 
@@ -510,11 +531,38 @@ class ReolinkClipCacheCoordinator:
             len(batch),
             len(pending),
         )
-        results = await asyncio.gather(
-            *(self._async_cache_clip(descriptor) for descriptor in batch),
-            return_exceptions=True,
-        )
-        return sum(1 for result in results if result is True)
+        cached = 0
+        consecutive_failures = 0
+        for index, descriptor in enumerate(batch):
+            if self._shutdown:
+                break
+            if index and DOWNLOAD_SPACING:
+                await asyncio.sleep(DOWNLOAD_SPACING)
+            try:
+                succeeded = await self._async_cache_clip(descriptor)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Unexpected error caching a clip")
+                succeeded = False
+
+            if succeeded:
+                cached += 1
+                consecutive_failures = 0
+                continue
+
+            consecutive_failures += 1
+            # With retries and backoff, grinding through a whole batch against
+            # an NVR that is refusing everything would tie up the sweep for
+            # many minutes. Give up early and try again next time.
+            if consecutive_failures >= CONSECUTIVE_FAILURE_LIMIT:
+                _LOGGER.warning(
+                    "%s: %d clips failed in a row, abandoning this sweep",
+                    camera.name,
+                    consecutive_failures,
+                )
+                break
+        return cached
 
     async def async_list_day(
         self, camera: CameraInfo, day: dt_date
@@ -676,14 +724,12 @@ class ReolinkClipCacheCoordinator:
                 if self._shutdown or self._is_cached(clip_id):
                     return False
 
-                source = await self._async_source_url(descriptor["media_content_id"])
-                if source is None:
-                    return False
-
                 clip_path = self.clip_path(clip_id)
                 part_path = clip_path.with_suffix(".part")
 
-                if not await self._async_download(source, part_path):
+                if not await self._async_download_with_retries(
+                    descriptor["media_content_id"], part_path
+                ):
                     await self.hass.async_add_executor_job(_unlink, part_path)
                     return False
 
@@ -752,6 +798,46 @@ class ReolinkClipCacheCoordinator:
             scheme = "https" if self.hass.http.ssl_certificate else "http"
             self._base_url = f"{scheme}://127.0.0.1:{self.hass.http.server_port}"
         return self._base_url
+
+    async def _async_download_with_retries(
+        self, media_content_id: str, dest: Path
+    ) -> int:
+        """Fetch a clip, retrying when the NVR drops the connection.
+
+        Reolink NVRs serve a limited number of playback sessions and hang up
+        when busy, which surfaces as "Server disconnected" from the playback
+        proxy. Backing off and asking again is usually enough; anything still
+        failing is left for a later sweep.
+        """
+        for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+            source = await self._async_source_url(media_content_id)
+            if source is None:
+                return 0
+
+            if written := await self._async_download(source, dest):
+                return written
+
+            await self.hass.async_add_executor_job(_unlink, dest)
+            if attempt < DOWNLOAD_ATTEMPTS:
+                delay = DOWNLOAD_RETRY_BACKOFF[
+                    min(attempt - 1, len(DOWNLOAD_RETRY_BACKOFF) - 1)
+                ]
+                _LOGGER.debug(
+                    "Retrying clip download in %ss (attempt %d of %d)",
+                    delay,
+                    attempt + 1,
+                    DOWNLOAD_ATTEMPTS,
+                )
+                await asyncio.sleep(delay)
+
+        _LOGGER.warning(
+            "Giving up on a clip after %d attempts; it will be retried on a "
+            "later sweep. If this keeps happening for every clip, try the "
+            "other stream in the integration options - some NVRs will not "
+            "serve downloads for one of them",
+            DOWNLOAD_ATTEMPTS,
+        )
+        return 0
 
     async def _async_download(self, url: str, dest: Path) -> int:
         """Stream a URL to disk. Returns the number of bytes written."""

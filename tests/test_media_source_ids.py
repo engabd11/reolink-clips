@@ -164,6 +164,24 @@ def main() -> int:
         print("\nFAILED EARLY")
         return 1
 
+    print("\n== manual camera selection ==")
+    for label, selection, expected in (
+        ("only the selected camera is cached", ["carport"], {"carport"}),
+        ("an empty selection still means every camera", [], {"back_door", "carport", "doorbell"}),
+        ("an unknown selection yields nothing rather than everything", ["nope"], set()),
+    ):
+        other = mod.ReolinkClipCacheCoordinator.__new__(mod.ReolinkClipCacheCoordinator)
+        other.hass = coordinator.hass
+        other.entry = types.SimpleNamespace(
+            entry_id="test",
+            options={**coordinator.entry.options, "cameras": selection},
+        )
+        other._cameras, other._index = {}, {}
+        other._unsub_detection, other._unsubs = None, []
+        other._restart_listeners = lambda: None
+        asyncio.run(other.async_discover())
+        check(label, set(other.cameras) == expected, str(sorted(other.cameras)))
+
     print("\n== clip listing ==")
     REQUESTED.clear()
     clips = asyncio.run(coordinator.async_list_day(cameras["carport"], dt.date(2026, 8, 24)))
