@@ -39,6 +39,15 @@ const slug = (value) =>
 
 const meta = (type) => EVENT_META[type] || EVENT_META.other;
 
+// Browse results carry a full media source URI; the Reolink identifiers we
+// parse and rebuild are the bare part after the slash.
+const MS_PREFIX = 'media-source://reolink/';
+const bare = (id) => {
+  const value = String(id == null ? '' : id);
+  return value.startsWith(MS_PREFIX) ? value.slice(MS_PREFIX.length) : value;
+};
+const uri = (id) => (String(id).startsWith(MS_PREFIX) ? String(id) : MS_PREFIX + id);
+
 // Camera names come from the device registry and the title from user config,
 // so they are escaped before going anywhere near innerHTML.
 const esc = (value) => String(value == null ? '' : value).replace(
@@ -720,8 +729,8 @@ class ReolinkClipsCard extends HTMLElement {
       media_content_id: camera.media_content_id,
     });
     const streams = (result.children || []).filter((child) =>
-      String(child.media_content_id).startsWith('RES|'));
-    const preferred = streams.find((child) => child.media_content_id.endsWith('|sub'));
+      bare(child.media_content_id).startsWith('RES|'));
+    const preferred = streams.find((child) => bare(child.media_content_id).endsWith('|sub'));
     return (preferred || streams[0] || {}).media_content_id || null;
   }
 
@@ -732,7 +741,7 @@ class ReolinkClipsCard extends HTMLElement {
       type: 'media_source/browse_media', media_content_id: streamId,
     });
     return (result.children || []).map((child) => {
-      const parts = String(child.media_content_id).split('|');
+      const parts = bare(child.media_content_id).split('|');
       if (parts.length !== 7 || parts[0] !== 'DAY') return null;
       const iso = `${parts[4]}-${String(parts[5]).padStart(2, '0')}-${String(parts[6]).padStart(2, '0')}`;
       return { date: iso, title: child.title };
@@ -743,18 +752,18 @@ class ReolinkClipsCard extends HTMLElement {
     const streamId = await this._fallbackStreamId(camera);
     if (!streamId) return [];
     const [year, month, day] = isoDate.split('-').map(Number);
-    const dayId = `${streamId.replace(/^RES\|/, 'DAY|')}|${year}|${month}|${day}`;
+    const dayId = uri(`${bare(streamId).replace(/^RES\|/, 'DAY|')}|${year}|${month}|${day}`);
 
     const dayResult = await this._hass.callWS({
       type: 'media_source/browse_media', media_content_id: dayId,
     });
     const folders = (dayResult.children || []).filter((child) =>
-      String(child.media_content_id).startsWith('EVE|'));
+      bare(child.media_content_id).startsWith('EVE|'));
 
     const sources = folders.length
       ? (await Promise.all(folders.map((folder) =>
           this._hass.callWS({ type: 'media_source/browse_media', media_content_id: folder.media_content_id })
-            .then((res) => ({ trigger: String(folder.media_content_id).split('|').pop().toLowerCase(), res }))
+            .then((res) => ({ trigger: bare(folder.media_content_id).split('|').pop().toLowerCase(), res }))
             .catch(() => null))))
       : [{ trigger: null, res: dayResult }];
 
@@ -777,7 +786,7 @@ class ReolinkClipsCard extends HTMLElement {
 
   _fallbackDescriptor(camera, child, trigger) {
     const id = String(child.media_content_id || '');
-    const parts = id.split('|');
+    const parts = bare(id).split('|');
     if (parts.length < 7 || parts[0] !== 'FILE') return null;
     const stamp = parts[parts.length - 2];
     const match = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/.exec(stamp);

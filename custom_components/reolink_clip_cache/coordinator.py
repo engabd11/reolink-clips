@@ -115,13 +115,37 @@ class _StubChild:
     title: str
 
 
+# Browse results carry a full media source URI
+# ("media-source://reolink/CAM|entry|0"), while the Reolink source's own
+# identifiers are the bare part after the slash. Anything we hand to
+# async_browse_media needs the URI form; anything we parse needs the bare form.
+MEDIA_SOURCE_PREFIX = f"{REOLINK_MEDIA_PREFIX}/"
+
+
+def bare_identifier(media_content_id: str) -> str:
+    """Return the Reolink identifier without the media source URI scheme."""
+    value = media_content_id or ""
+    if value.startswith(MEDIA_SOURCE_PREFIX):
+        return value[len(MEDIA_SOURCE_PREFIX):]
+    return value
+
+
+def media_uri(identifier: str) -> str:
+    """Return the browsable media source URI for a Reolink identifier."""
+    if identifier.startswith(MEDIA_SOURCE_PREFIX):
+        return identifier
+    return f"{MEDIA_SOURCE_PREFIX}{identifier}"
+
+
 def clip_id_for(media_content_id: str) -> str:
     """Return the stable local id for a media source item.
 
     Derived from the media content id rather than from anything a caller
-    supplies, so ids can never be steered at the filesystem.
+    supplies, so ids can never be steered at the filesystem. The URI scheme is
+    stripped first so the id is the same whichever form the caller passes.
     """
-    return hashlib.sha1(media_content_id.encode("utf-8")).hexdigest()[:16]
+    identifier = bare_identifier(media_content_id).encode("utf-8")
+    return hashlib.sha1(identifier).hexdigest()[:16]
 
 
 def _local_tz():
@@ -296,7 +320,7 @@ class ReolinkClipCacheCoordinator:
         by_name: dict[str, CameraInfo] = {}
 
         for child in root.children or []:
-            parts = (child.media_content_id or "").split("|")
+            parts = bare_identifier(child.media_content_id).split("|")
             if len(parts) != 3 or parts[0] != "CAM":
                 continue
             _, entry_id, channel = parts
@@ -499,7 +523,7 @@ class ReolinkClipCacheCoordinator:
         *resolving* a clip for playback that is slow, which is exactly what
         this cache exists to avoid.
         """
-        day_id = (
+        day_id = media_uri(
             f"DAY|{camera.entry_id}|{camera.channel}|{self.stream}"
             f"|{day.year}|{day.month}|{day.day}"
         )
@@ -518,12 +542,14 @@ class ReolinkClipCacheCoordinator:
         event_folders = [
             child
             for child in day_result.children or []
-            if (child.media_content_id or "").startswith("EVE|")
+            if bare_identifier(child.media_content_id).startswith("EVE|")
         ]
 
         if event_folders:
             for folder in event_folders:
-                trigger = normalise_trigger(folder.media_content_id.split("|")[-1])
+                trigger = normalise_trigger(
+                    bare_identifier(folder.media_content_id).split("|")[-1]
+                )
                 if trigger not in wanted:
                     continue
                 try:
@@ -582,7 +608,7 @@ class ReolinkClipCacheCoordinator:
         instead of guessing from when the download happened to run.
         """
         media_content_id = child.media_content_id or ""
-        parts = media_content_id.split("|", 6)
+        parts = bare_identifier(media_content_id).split("|", 6)
         if len(parts) != 7 or parts[0] != "FILE":
             return None
 
@@ -944,7 +970,7 @@ class ReolinkClipCacheCoordinator:
         if camera is None:
             return []
 
-        stream_id = f"RES|{camera.entry_id}|{camera.channel}|{self.stream}"
+        stream_id = media_uri(f"RES|{camera.entry_id}|{camera.channel}|{self.stream}")
         try:
             result = await async_browse_media(self.hass, stream_id)
         except Exception as err:  # noqa: BLE001
@@ -953,7 +979,7 @@ class ReolinkClipCacheCoordinator:
 
         days: list[dict[str, Any]] = []
         for child in result.children or []:
-            parts = (child.media_content_id or "").split("|")
+            parts = bare_identifier(child.media_content_id).split("|")
             if len(parts) != 7 or parts[0] != "DAY":
                 continue
             try:
@@ -1067,7 +1093,7 @@ class ReolinkClipCacheCoordinator:
 
     async def _async_cache_on_demand(self, media_content_id: str) -> None:
         """Cache a single clip the card asked for."""
-        parts = media_content_id.split("|", 6)
+        parts = bare_identifier(media_content_id).split("|", 6)
         if len(parts) != 7 or parts[0] != "FILE":
             return
 
