@@ -1,0 +1,59 @@
+name: Validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  hassfest:
+    name: hassfest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: home-assistant/actions/hassfest@master
+
+  hacs:
+    name: HACS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hacs/action@main
+        with:
+          category: integration
+
+  syntax:
+    name: Syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Compile the integration
+        run: python -m compileall -q custom_components/reolink_clip_cache
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Check the card
+        run: node --check custom_components/reolink_clip_cache/frontend/reolink-clips-card.js
+      - name: Check translations mirror strings.json
+        run: |
+          python - <<'PY'
+          import json, pathlib
+          base = pathlib.Path("custom_components/reolink_clip_cache")
+          def keys(d, prefix=""):
+              out = set()
+              for k, v in d.items():
+                  out.add(prefix + k)
+                  if isinstance(v, dict):
+                      out |= keys(v, prefix + k + ".")
+              return out
+          a = keys(json.loads((base / "strings.json").read_text(encoding="utf-8")))
+          b = keys(json.loads((base / "translations/en.json").read_text(encoding="utf-8")))
+          assert a == b, f"strings.json and translations/en.json differ: {a ^ b}"
+          print(f"{len(a)} keys match")
+          PY

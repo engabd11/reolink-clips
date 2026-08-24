@@ -2,131 +2,175 @@
 
 **Instant playback for your Reolink NVR event clips in Home Assistant.**
 
-## The Problem
+[![Validate](https://github.com/engabd11/reolink-clips/actions/workflows/validate.yml/badge.svg)](https://github.com/engabd11/reolink-clips/actions/workflows/validate.yml)
 
-Viewing recorded clips from a Reolink NVR through Home Assistant takes 20+ seconds per clip. The NVR has to seek through continuous recordings, remux the segment, and serve it over HTTP — every single time you click play.
+## The problem
 
-## The Solution
+Playing a recorded clip from a Reolink NVR through Home Assistant takes 20–30 seconds,
+and sometimes fails outright until you refresh the card a few times. Every play makes the
+NVR seek through its continuous recording, remux the segment and stream it back through a
+proxy — from scratch, every single time.
 
-This integration **pre-caches event clips** (Person, Vehicle, Animal) to local storage when your Reolink cameras detect them. When you browse clips on your dashboard, cached clips load in **1-2 seconds** instead of 20+.
+## The solution
 
-### How It Works
+This integration watches your NVR for new Person / Vehicle / Animal recordings and pulls
+them into local storage ahead of time, with the MP4 index moved to the front so a browser
+can start playing on the first chunk. The companion card then plays from local storage.
 
 ```
-Reolink detects person/vehicle/animal
+Reolink NVR finishes writing an event recording
          │
          ▼
-HA binary_sensor triggers ON
+Sweep spots it in the media source (every 2 min, or ~20 s after a detection ends)
          │
          ▼
-Integration downloads clip from NVR → ffmpeg faststart → saves locally
+Downloaded → ffmpeg faststart → poster frame → indexed
          │
          ▼
-Card plays from /local/reolink_cache/ → INSTANT playback
-         (falls back to NVR if not yet cached)
+Card plays it over an authenticated local URL — no NVR round trip
+         (uncached clips still play from the NVR, and cache themselves for next time)
 ```
 
 ## Features
 
-- **Cache-first playback** — Card tries local cache before hitting NVR API
-- **Automatic caching** — Clips downloaded on detection events (Person, Vehicle, Animal only)
-- **Faststart optimization** — `ffmpeg -moov_to_start` on every clip for instant seek
-- **Auto-purge** — Configurable retention (default 7 days)
-- **WebSocket API** — Custom endpoints for the card to query cached clips
-- **Graceful fallback** — If a clip isn't cached yet, falls back to NVR (same 20s, but only for very recent events)
-- **Cache badge** — Green "CACHED" indicator on clips played from local storage
-- **Status sensor** — Monitor cache size and clip counts
+- **Cache-first playback** — one WebSocket call returns a whole day of clips with local
+  URLs and thumbnails already attached
+- **Correct clip matching** — recordings are identified by the start/end times the Reolink
+  media source encodes, not by guessing from when a sensor fired
+- **Automatic camera discovery** — cameras and their detection sensors are found through
+  the Reolink integration; nothing to name by hand
+- **Private storage** — clips live outside `www/` and are served over authenticated,
+  short-lived signed URLs
+- **Thumbnail filmstrip** — scrub the day at a glance, click any frame to jump to it
+- **Live updates** — the card refreshes itself when a new clip is cached
+- **Retention by age and size** — oldest clips are evicted once either limit is hit
+- **Graceful fallback** — an uncached clip plays from the NVR and caches in the background
+
+## Requirements
+
+- Home Assistant 2024.11 or newer
+- The Reolink integration set up, with an NVR that has a working hard disk
+- ffmpeg (bundled with Home Assistant OS, Container and Supervised)
 
 ## Installation
 
-### Via HACS (Recommended)
+### HACS
 
-1. Add this repository as a custom repository in HACS
-2. Install "Reolink Clip Cache"
-3. Restart Home Assistant
+1. HACS → Integrations → ⋮ → **Custom repositories**
+2. Add `https://github.com/engabd11/reolink-clips` with category **Integration**
+3. Install **Reolink Clip Cache** and restart Home Assistant
 
 ### Manual
 
-1. Copy `custom_components/reolink_clip_cache/` to your `<config>/custom_components/` directory
-2. Restart Home Assistant
+Copy `custom_components/reolink_clip_cache/` into your `<config>/custom_components/`
+directory and restart Home Assistant.
 
 ## Setup
 
-1. Go to **Settings → Devices & Services → Add Integration**
-2. Search for **Reolink Clip Cache**
-3. Configure retention days and resolution
-4. The integration auto-discovers your Reolink cameras
+1. **Settings → Devices & Services → Add Integration → Reolink Clip Cache**
+2. Pick the event types to cache, the stream resolution and the retention limits
+3. That's it — cameras are discovered automatically
 
-## Dashboard Card
+The dashboard card is registered by the integration itself, so there is **no dashboard
+resource to add**. Add a card, search for *Reolink Clips Card*, and configure it in the
+visual editor.
 
-Install the companion card alongside the integration. Add this to your dashboard resources:
+### Card options
 
-```yaml
-resources:
-  - url: /local/reolink-clips-card.js
-    type: module
-```
-
-Then add the card with cache support enabled:
+Everything is optional; the defaults work.
 
 ```yaml
 type: custom:reolink-clips-card
-cameras:
-  - name: BACK DOOR
-    sensors:
-      person: binary_sensor.back_door_person
-      vehicle: binary_sensor.back_door_vehicle
-      animal: binary_sensor.back_door_animal
-  - name: Carport
-    sensors:
-      person: binary_sensor.carport_person
-      vehicle: binary_sensor.carport_vehicle
-      animal: binary_sensor.carport_animal
-  - name: Doorbell
-    sensors:
-      person: binary_sensor.doorbell_person
-      visitor: binary_sensor.doorbell_visitor
-      package: binary_sensor.doorbell_package
-      vehicle: binary_sensor.doorbell_vehicle
-resolution: low
-cache_enabled: true    # ← Enables instant playback from local cache
+title: Events
+cameras: [carport, back_door]   # omit for every discovered camera
+default_event_type: all         # all | person | vehicle | animal | package | visitor
+thumbnails: true                # thumbnail filmstrip under the player
+autoplay: false                 # play the newest clip on load
 ```
 
-### New Config Option
+| Option | Default | Description |
+|---|---|---|
+| `title` | `Events` | Card heading |
+| `cameras` | all | Camera keys to show, in tab order. Camera names also work. |
+| `default_event_type` | `all` | Filter selected when the card loads |
+| `thumbnails` | `true` | Show the filmstrip and prefetch adjacent clips |
+| `autoplay` | `false` | Start the newest clip automatically |
+
+### Integration options
 
 | Option | Default | Description |
-|--------|---------|-------------|
-| `cache_enabled` | `false` | Enable cache-first clip loading |
-
-When enabled, the card queries the integration's WebSocket API before falling back to the NVR. Cached clips show a green **CACHED** badge.
+|---|---|---|
+| Event types | Person, Vehicle, Animal | What to cache. Motion is not offered — it fires far too often to be worth caching. |
+| Stream | Low resolution | `sub` caches fast and small; `main` is the full-quality recording |
+| Keep clips for | 7 days | Age limit |
+| Maximum cache size | 2048 MB | Size ceiling; oldest clips are evicted first |
+| Check for new clips every | 2 min | Sweep interval. A detection also triggers a check ~20 s after the event ends. |
 
 ## Services
 
 | Service | Description |
-|---------|-------------|
-| `reolink_clip_cache.purge_cache` | Manually purge old clips |
-| `reolink_clip_cache.refresh_cache` | Rebuild cache index from disk |
+|---|---|
+| `reolink_clip_cache.sweep_now` | Look for new recordings immediately. Takes optional `camera` and `days` (for backfilling earlier days). |
+| `reolink_clip_cache.purge_cache` | Apply the age and size limits now |
+| `reolink_clip_cache.refresh_cache` | Re-discover cameras and reconcile the index with the disk |
 
-## How It Doesn't Work
+## Storage and privacy
 
-- ❌ Does NOT replace your NVR recordings — it's a cache layer
-- ❌ Does NOT require Frigate — uses your Reolink NVR's existing detection
-- ❌ Does NOT cache motion clips — only Person, Vehicle, Animal
-- ❌ Does NOT re-encode — copies stream as-is, just adds faststart
+Clips are stored in `<config>/reolink_clip_cache/` — deliberately **not** in
+`<config>/www/`. Anything under `www/` is served at `/local/...` to anyone who can reach
+your Home Assistant, with no login. This integration serves clips from an authenticated
+endpoint instead, and the card is handed short-lived signed URLs.
 
-## Storage
+Rough sizing at low resolution: ~2 MB per clip, so 5 events/day across 4 cameras is about
+40 MB/day, or ~280 MB at the default 7-day retention.
 
-- Clips stored in `/config/www/reolink_cache/`
-- Typical: ~5 events/day × 4 cameras × ~2MB per clip = ~40MB/day
-- With 7-day retention: ~280MB total
-- Configurable retention period
+## Sensors
 
-## Requirements
+- **Cache size** — megabytes currently held
+- **Cached clips** — number of clips, with a per-camera breakdown and the most recent clip
+  in its attributes
 
-- Home Assistant 2024.1+
-- Reolink integration configured with media source
-- ffmpeg (included with Home Assistant)
+## What this is not
+
+- Not a replacement for your NVR recordings — it is a cache in front of them
+- Not a Frigate replacement — it uses your Reolink cameras' own detection
+- Not a re-encoder — the stream is copied as-is, only the MP4 index is moved
+
+## Upgrading from 1.x
+
+Version 2.0 is a rewrite; 1.x never actually served anything from its cache.
+
+- Cached clips moved from `<config>/www/reolink_cache/` to `<config>/reolink_clip_cache/`.
+  **Delete the old `www/reolink_cache/` folder** — nothing reads it any more, and it is
+  publicly readable.
+- The card no longer needs a dashboard resource entry. Remove the old
+  `/local/reolink-clips-card.js` resource, and delete that file from `www/`.
+- Card config changed: `sensors:` and `resolution:` are gone (both are discovered or set
+  in the integration options). A 1.x `cameras:` list is still understood — camera names
+  are matched to discovered cameras.
+- The `reolink_clip_cache/browse` and `.../thumbnail` WebSocket commands were replaced by
+  `cameras`, `dates`, `clips`, `resolve` and `status`.
+- Your existing config entry migrates automatically; `resolution: clear` becomes the
+  high-resolution stream, anything else becomes low resolution.
+
+## Troubleshooting
+
+Turn on debug logging:
+
+```yaml
+logger:
+  logs:
+    custom_components.reolink_clip_cache: debug
+```
+
+- **No cameras discovered** — the Reolink integration must be loaded and the NVR needs a
+  working hard disk; cameras without playback support are skipped by the media source.
+- **Clips never cache** — call `reolink_clip_cache.sweep_now` and check the log. Verify the
+  chosen event types actually appear as folders under the day in Media → Reolink.
+- **Clips play but slowly** — they are not cached yet. The `CACHED` badge and the green dot
+  on a thumbnail tell you which clips are local.
 
 ## Credits
 
-Built by [engabd11](https://github.com/engabd11). Earthy Dark card design inspired by the original Reolink Clips Card v4.3.
+Built by [engabd11](https://github.com/engabd11). Earthy Dark card design carried over from
+the original Reolink Clips Card.
