@@ -194,6 +194,21 @@ def main() -> int:
     check("media_content_id stored in URI form",
           clips and clips[0]["media_content_id"].startswith("media-source://reolink/"))
 
+    print("\n== unfiltered listing (what diagnostics uses) ==")
+    folders: list[str] = []
+    everything = asyncio.run(coordinator.async_list_day(
+        cameras["carport"], dt.date(2026, 8, 24), event_types=set(), folders_seen=folders
+    ))
+    check("an empty filter accepts every trigger", len(everything) == 3,
+          f"{len(everything)} clips")
+    check("motion is included when nothing is filtered",
+          any("motion" in clip["event_types"] for clip in everything),
+          str([c["event_types"] for c in everything]))
+    check("trigger folders are reported", sorted(set(folders)) == ["motion", "person"],
+          str(sorted(set(folders))))
+    check("the configured filter still applies by default",
+          len(asyncio.run(coordinator.async_list_day(cameras["carport"], dt.date(2026, 8, 24)))) == 2)
+
     print("\n== dates ==")
     REQUESTED.clear()
     dates = asyncio.run(coordinator.async_dates("carport"))

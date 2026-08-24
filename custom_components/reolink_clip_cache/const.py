@@ -69,6 +69,9 @@ DOWNLOAD_SPACING: Final = 2
 # VOD request types to try against the NVR, best first. Home Assistant always
 # asks an NVR for Download, but many will not serve that and hang up; those
 # want the recording prepared through NvrDownload first.
+# How many days back the diagnose service looks for a clip to test.
+DIAGNOSE_DAYS: Final = 3
+
 VOD_TYPE_LADDER: Final = ("DOWNLOAD", "NVR_DOWNLOAD", "PLAYBACK")
 
 # Abandon a sweep once this many clips fail back to back.
