@@ -1,0 +1,38 @@
+purge_cache:
+  name: Purge cache
+  description: >-
+    Apply the retention limits immediately, deleting cached clips that are
+    older than the configured number of days or that push the cache over its
+    size ceiling.
+
+refresh_cache:
+  name: Refresh cache
+  description: >-
+    Re-discover Reolink cameras and reconcile the clip index against the files
+    on disk. Use this after renaming a camera or adding one to the NVR.
+
+sweep_now:
+  name: Sweep now
+  description: >-
+    Look for new recordings straight away instead of waiting for the next
+    scheduled sweep. Also useful for backfilling earlier days.
+  fields:
+    camera:
+      name: Camera
+      description: Camera key to sweep. Leave empty to sweep every camera.
+      required: false
+      example: carport
+      selector:
+        text:
+    days:
+      name: Days
+      description: How many days back to sweep, counting today.
+      required: false
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 30
+          step: 1
+          unit_of_measurement: days
+          mode: box

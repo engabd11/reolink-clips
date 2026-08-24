@@ -3,9 +3,13 @@
   "name": "Reolink Clip Cache",
   "codeowners": ["@engabd11"],
   "config_flow": true,
-  "documentation": "https://github.com/engabd11/reolink_clip_cache",
+  "dependencies": ["ffmpeg", "frontend", "http", "media_source", "websocket_api"],
+  "after_dependencies": ["reolink"],
+  "documentation": "https://github.com/engabd11/reolink-clips",
+  "integration_type": "service",
   "iot_class": "local_polling",
-  "issue_tracker": "https://github.com/engabd11/reolink_clip_cache/issues",
+  "issue_tracker": "https://github.com/engabd11/reolink-clips/issues",
   "requirements": [],
-  "version": "1.0.0"
+  "single_config_entry": true,
+  "version": "2.0.0"
 }
