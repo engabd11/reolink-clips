@@ -170,10 +170,12 @@ logger:
   chosen event types actually appear as folders under the day in Media → Reolink.
 - **Clips play but slowly** — they are not cached yet. The `CACHED` badge and the green dot
   on a thumbnail tell you which clips are local.
-- **`Clip download failed: ... Server disconnected`** — the NVR hung up on Home Assistant.
-  Clips are retried with a backoff and picked up again on later sweeps. If it happens for
-  every clip, switch the stream option to the other resolution: some NVRs refuse to serve
-  downloads for one of them. Reducing how often the sweep runs also helps a busy NVR.
+- **`Clip download ... Server disconnected`** — the NVR hung up. Clips are fetched from the
+  NVR directly when possible and via Home Assistant's proxy otherwise, retried with a
+  backoff, and picked up again on later sweeps. The log names which route failed. If it
+  happens for every clip, switch the stream option to the other resolution: some NVRs
+  refuse to serve downloads for one of them. Reducing how often the sweep runs also helps
+  a busy NVR.
 
 ## Credits
 

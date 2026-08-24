@@ -90,6 +90,16 @@ DOWNLOAD_HEADERS: Final = {
     "Accept": "*/*",
     "Accept-Encoding": "identity",
     "User-Agent": "Mozilla/5.0 (compatible; HomeAssistant reolink_clip_cache)",
+    # Never reuse a pooled connection: an NVR that hung up on the previous
+    # transfer is the classic source of "Server disconnected".
+    "Connection": "close",
+}
+
+# Talking to the NVR directly, where there is no proxy to imitate a browser for.
+DIRECT_HEADERS: Final = {
+    "Accept": "*/*",
+    "Accept-Encoding": "identity",
+    "Connection": "close",
 }
 
 # A ranged or chunked reply is still a good reply.
