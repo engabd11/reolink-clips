@@ -1,10 +1,10 @@
 {
   "domain": "reolink_clip_cache",
   "name": "Reolink Clip Cache",
+  "after_dependencies": ["reolink"],
   "codeowners": ["@engabd11"],
   "config_flow": true,
   "dependencies": ["ffmpeg", "frontend", "http", "media_source", "websocket_api"],
-  "after_dependencies": ["reolink"],
   "documentation": "https://github.com/engabd11/reolink-clips",
   "integration_type": "service",
   "iot_class": "local_polling",
