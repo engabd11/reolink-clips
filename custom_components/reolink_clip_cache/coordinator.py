@@ -55,12 +55,14 @@ from .const import (
     DEFAULT_STREAM,
     DEFAULT_SWEEP_MINUTES,
     DOWNLOAD_CHUNK_SIZE,
+    DOWNLOAD_HEADERS,
     DOWNLOAD_TIMEOUT,
     EVENT_CLIP_CACHED,
     EVENT_SETTLE_DELAY,
     FFMPEG_TIMEOUT,
     MAX_CLIPS_PER_SWEEP,
     MAX_CONCURRENT_DOWNLOADS,
+    OK_STATUSES,
     REOLINK_DOMAIN,
     REOLINK_MEDIA_PREFIX,
     SIGNAL_INDEX_UPDATED,
@@ -740,7 +742,9 @@ class ReolinkClipCacheCoordinator:
         signed = async_sign_path(
             self.hass, url, timedelta(seconds=DOWNLOAD_TIMEOUT + 60)
         )
-        return f"{self._internal_base_url()}{signed}"
+        full = f"{self._internal_base_url()}{signed}"
+        _LOGGER.debug("Fetching clip via the Reolink proxy: %s", full)
+        return full
 
     def _internal_base_url(self) -> str:
         """Return a loopback base URL for HA's own HTTP server."""
@@ -755,10 +759,19 @@ class ReolinkClipCacheCoordinator:
         written = 0
         try:
             async with asyncio.timeout(DOWNLOAD_TIMEOUT):
-                async with session.get(url) as response:
-                    if response.status != 200:
+                async with session.get(url, headers=DOWNLOAD_HEADERS) as response:
+                    if response.status not in OK_STATUSES:
+                        # The Reolink proxy explains itself in the body; without
+                        # this the failure is just a bare status code.
+                        try:
+                            detail = (await response.text())[:400].strip()
+                        except Exception:  # noqa: BLE001
+                            detail = "<unreadable body>"
                         _LOGGER.warning(
-                            "Clip download returned HTTP %s", response.status
+                            "Clip download failed: HTTP %s (%s) - %s",
+                            response.status,
+                            response.content_type,
+                            detail or "<empty body>",
                         )
                         return 0
                     handle = await self.hass.async_add_executor_job(_open_write, dest)
