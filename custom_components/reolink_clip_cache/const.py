@@ -66,6 +66,11 @@ DOWNLOAD_RETRY_BACKOFF: Final = (5, 20)
 # Breathing room between clips so a sweep does not hammer the NVR.
 DOWNLOAD_SPACING: Final = 2
 
+# VOD request types to try against the NVR, best first. Home Assistant always
+# asks an NVR for Download, but many will not serve that and hang up; those
+# want the recording prepared through NvrDownload first.
+VOD_TYPE_LADDER: Final = ("DOWNLOAD", "NVR_DOWNLOAD", "PLAYBACK")
+
 # Abandon a sweep once this many clips fail back to back.
 CONSECUTIVE_FAILURE_LIMIT: Final = 3
 
@@ -152,3 +157,4 @@ SIGNAL_INDEX_UPDATED: Final = f"{DOMAIN}_index_updated"
 SERVICE_PURGE_CACHE: Final = "purge_cache"
 SERVICE_REFRESH_CACHE: Final = "refresh_cache"
 SERVICE_SWEEP_NOW: Final = "sweep_now"
+SERVICE_DIAGNOSE: Final = "diagnose"

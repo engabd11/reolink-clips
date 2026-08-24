@@ -83,6 +83,7 @@ from .const import (
     THUMBS_DIR_NAME,
     THUMB_URL,
     TRIGGER_ALIASES,
+    VOD_TYPE_LADDER,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -210,6 +211,8 @@ class ReolinkClipCacheCoordinator:
         self._unsub_detection: CALLBACK_TYPE | None = None
         self._pending_sweeps: dict[str, CALLBACK_TYPE] = {}
         self._base_url: str | None = None
+        # camera key -> the VOD request type that actually works for it
+        self._vod_types: dict[str, str] = {}
         self._shutdown = False
 
     # ── Options ────────────────────────────────────────────────────────
@@ -800,13 +803,32 @@ class ReolinkClipCacheCoordinator:
             self._base_url = f"{scheme}://127.0.0.1:{self.hass.http.server_port}"
         return self._base_url
 
-    async def _async_direct_source(self, descriptor: dict[str, Any]) -> str | None:
+    def _vod_type_order(self, descriptor: dict[str, Any]) -> list[str]:
+        """Return the VOD request types to try for a camera, best first.
+
+        Home Assistant always asks an NVR for ``Download``, but plenty of NVRs
+        refuse that and hang up, and want the recording prepared through
+        ``NvrDownload`` first. Once one works for a camera it is used on its
+        own.
+        """
+        if known := self._vod_types.get(self._camera_marker(descriptor)):
+            return [known]
+        return list(VOD_TYPE_LADDER)
+
+    @staticmethod
+    def _camera_marker(descriptor: dict[str, Any]) -> str:
+        """Return a per-camera key for remembering what works."""
+        return f"{descriptor.get('camera')}"
+
+    async def _async_direct_source(
+        self, descriptor: dict[str, Any], request_type_name: str = "DOWNLOAD"
+    ) -> str | None:
         """Ask the Reolink integration for the NVR's own URL for a clip.
 
         This mirrors what Home Assistant's playback proxy does internally.
         Returns None whenever the Reolink integration is not importable, the
-        recording is only offered as a live stream, or anything else does not
-        line up - the proxy remains as the fallback.
+        request type does not apply, or anything else does not line up - the
+        proxy remains as the fallback.
         """
         parts = bare_identifier(descriptor["media_content_id"]).split("|", 6)
         if len(parts) != 7 or parts[0] != "FILE":
@@ -818,25 +840,23 @@ class ReolinkClipCacheCoordinator:
             from reolink_aio.enums import VodRequestType
 
             api = get_host(self.hass, entry_id).api
+            request_type = VodRequestType[request_type_name]
 
-            if filename.endswith((".mp4", ".vref")) or api.is_hub:
-                request_type = (
-                    VodRequestType.DOWNLOAD if api.is_nvr else VodRequestType.PLAYBACK
-                )
-            elif api.is_nvr:
+            if request_type is VodRequestType.NVR_DOWNLOAD:
+                if not api.is_nvr:
+                    return None
                 # This form asks the NVR to prepare the recording first.
-                request_type = VodRequestType.NVR_DOWNLOAD
                 filename = f"{start_id}_{end_id}"
-            else:
-                # Anything else is only available as a live stream.
-                return None
 
             _mime, url = await api.get_vod_source(
                 int(channel), filename, stream, request_type
             )
         except Exception as err:  # noqa: BLE001 - must never break caching
             _LOGGER.debug(
-                "No direct NVR URL for this clip (%s): %s", type(err).__name__, err
+                "No direct NVR URL via %s (%s): %s",
+                request_type_name,
+                type(err).__name__,
+                err,
             )
             return None
 
@@ -852,18 +872,34 @@ class ReolinkClipCacheCoordinator:
         disconnected" comes from. Fetching the NVR's own URL ourselves removes
         that hop, refuses connection reuse and allows a longer read window.
         """
+        marker = self._camera_marker(descriptor)
         for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
-            if direct := await self._async_direct_source(descriptor):
+            tried_anything = False
+            for type_name in self._vod_type_order(descriptor):
+                direct = await self._async_direct_source(descriptor, type_name)
+                if direct is None:
+                    continue
+                tried_anything = True
                 written = await self._async_download(
-                    direct, dest, headers=DIRECT_HEADERS, label="the NVR directly"
+                    direct,
+                    dest,
+                    headers=DIRECT_HEADERS,
+                    label=f"the NVR directly ({type_name})",
                 )
                 if written:
+                    if self._vod_types.get(marker) != type_name:
+                        _LOGGER.info(
+                            "Using the %s request type for %s",
+                            type_name,
+                            descriptor.get("camera_name") or marker,
+                        )
+                        self._vod_types[marker] = type_name
                     return written
                 await self.hass.async_add_executor_job(_unlink, dest)
 
             source = await self._async_source_url(descriptor["media_content_id"])
             if source is None:
-                if not direct:
+                if not tried_anything:
                     return 0
             elif written := await self._async_download(
                 source, dest, label="the Home Assistant proxy"
@@ -1295,6 +1331,85 @@ class ReolinkClipCacheCoordinator:
         if descriptor and await self._async_cache_clip(descriptor):
             self._schedule_save()
             async_dispatcher_send(self.hass, SIGNAL_INDEX_UPDATED)
+
+    # ── Diagnostics ────────────────────────────────────────────────────
+
+    async def async_diagnose(self, camera_key: str | None = None) -> dict[str, Any]:
+        """Try every route for one clip and report what each one did.
+
+        Reolink NVRs vary in which VOD request types they will serve, and a
+        refusal arrives as a dropped connection rather than a useful error.
+        This tries them all against a single real recording so the answer is
+        measured rather than guessed at.
+        """
+        if not self._cameras:
+            await self.async_discover()
+
+        cameras = (
+            [self._cameras[camera_key]]
+            if camera_key and camera_key in self._cameras
+            else list(self._cameras.values())
+        )
+
+        report: dict[str, Any] = {
+            "stream": self.stream,
+            "event_types": self.event_types,
+            "cameras": {},
+        }
+
+        for camera in cameras:
+            try:
+                clips = await self.async_list_day(camera, dt_util.now().date())
+            except Exception as err:  # noqa: BLE001
+                report["cameras"][camera.name] = {"error": f"listing failed: {err}"}
+                continue
+            if not clips:
+                report["cameras"][camera.name] = {"error": "no clips found today"}
+                continue
+
+            descriptor = clips[0]
+            routes: dict[str, str] = {}
+            for type_name in VOD_TYPE_LADDER:
+                url = await self._async_direct_source(descriptor, type_name)
+                routes[f"direct/{type_name}"] = (
+                    await self._async_probe(url, DIRECT_HEADERS)
+                    if url
+                    else "no URL for this request type"
+                )
+            proxy = await self._async_source_url(descriptor["media_content_id"])
+            routes["home assistant proxy"] = (
+                await self._async_probe(proxy, DOWNLOAD_HEADERS)
+                if proxy
+                else "could not be resolved"
+            )
+
+            report["cameras"][camera.name] = {
+                "clip": descriptor.get("title"),
+                "start": descriptor.get("start"),
+                "routes": routes,
+            }
+            _LOGGER.warning("Clip cache diagnosis for %s: %s", camera.name, routes)
+
+        return report
+
+    async def _async_probe(self, url: str, headers: dict[str, str]) -> str:
+        """Ask for the first slice of a clip and describe what came back."""
+        session = async_get_clientsession(self.hass, verify_ssl=False)
+        probe = {**headers, "Range": "bytes=0-65535"}
+        try:
+            async with asyncio.timeout(30):
+                async with session.get(url, headers=probe) as response:
+                    body = await response.content.read(65536)
+                    if response.status in OK_STATUSES:
+                        return f"OK - HTTP {response.status}, {len(body)} bytes, {response.content_type}"
+                    detail = body[:200].decode("utf-8", "replace").strip()
+                    return f"HTTP {response.status} ({response.content_type}) {detail}"
+        except TimeoutError:
+            return "timed out after 30s"
+        except ClientError as err:
+            return f"{type(err).__name__}: {err}"
+        except Exception as err:  # noqa: BLE001
+            return f"{type(err).__name__}: {err}"
 
     def stats(self) -> dict[str, Any]:
         """Return cache statistics for the status command and the sensors."""

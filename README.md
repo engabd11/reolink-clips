@@ -114,6 +114,7 @@ autoplay: false                 # play the newest clip on load
 | `reolink_clip_cache.sweep_now` | Look for new recordings immediately. Takes optional `camera` and `days` (for backfilling earlier days). |
 | `reolink_clip_cache.purge_cache` | Apply the age and size limits now |
 | `reolink_clip_cache.refresh_cache` | Re-discover cameras and reconcile the index with the disk |
+| `reolink_clip_cache.diagnose` | Try every download route against one real recording and report what each did. Returns a response — run it from Developer Tools → Actions. |
 
 ## Storage and privacy
 
@@ -172,10 +173,12 @@ logger:
   on a thumbnail tell you which clips are local.
 - **`Clip download ... Server disconnected`** — the NVR hung up. Clips are fetched from the
   NVR directly when possible and via Home Assistant's proxy otherwise, retried with a
-  backoff, and picked up again on later sweeps. The log names which route failed. If it
-  happens for every clip, switch the stream option to the other resolution: some NVRs
-  refuse to serve downloads for one of them. Reducing how often the sweep runs also helps
-  a busy NVR.
+  backoff, and picked up again on later sweeps. The log names which route failed. NVRs
+  differ in which VOD request types they will serve, and a refusal arrives as a dropped
+  connection rather than a useful error, so the integration tries `Download`,
+  `NvrDownload` and `Playback` in turn and sticks with whichever works. **Run
+  `reolink_clip_cache.diagnose`** to see exactly what each route does for one real
+  recording. Switching the stream option to the other resolution is also worth a try.
 
 ## Credits
 

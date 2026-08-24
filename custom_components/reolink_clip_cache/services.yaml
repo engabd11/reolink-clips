@@ -36,3 +36,17 @@ sweep_now:
           step: 1
           unit_of_measurement: days
           mode: box
+
+diagnose:
+  name: Diagnose downloads
+  description: >-
+    Try every download route against one real recording and report what each
+    one did. Use this when clips are found but never cache.
+  fields:
+    camera:
+      name: Camera
+      description: Camera key to test. Leave empty to test every camera.
+      required: false
+      example: carport
+      selector:
+        text:
