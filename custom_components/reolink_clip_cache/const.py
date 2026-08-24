@@ -66,7 +66,22 @@ EVENT_SETTLE_DELAY: Final = 20
 # Never sweep the same camera more often than this, however many events fire.
 SWEEP_COOLDOWN: Final = timedelta(seconds=15)
 
-MAX_CONCURRENT_DOWNLOADS: Final = 2
+# Reolink NVRs serve a limited number of playback sessions and get unhappy when
+# several VOD downloads overlap, so clips are pulled one at a time.
+MAX_CONCURRENT_DOWNLOADS: Final = 1
+
+# The Reolink playback proxy forwards these headers straight on to the NVR,
+# which is fussy about what it receives. The same proxy serves the media
+# browser happily, so send something close to what a browser sends rather than
+# aiohttp's defaults (notably no gzip, and not a Python user agent).
+DOWNLOAD_HEADERS: Final = {
+    "Accept": "*/*",
+    "Accept-Encoding": "identity",
+    "User-Agent": "Mozilla/5.0 (compatible; HomeAssistant reolink_clip_cache)",
+}
+
+# A ranged or chunked reply is still a good reply.
+OK_STATUSES: Final = (200, 206)
 
 # Cap the work one sweep takes on. Descriptors are newest-first, so a large
 # backfill still caches the most recent clips first and finishes over a few
