@@ -58,6 +58,7 @@ from .const import (
     DEFAULT_MAX_CACHE_MB,
     DEFAULT_STREAM,
     DEFAULT_SWEEP_MINUTES,
+    DIAGNOSE_DAYS,
     DIRECT_HEADERS,
     DOWNLOAD_ATTEMPTS,
     DOWNLOAD_CHUNK_SIZE,
@@ -571,13 +572,21 @@ class ReolinkClipCacheCoordinator:
         return cached
 
     async def async_list_day(
-        self, camera: CameraInfo, day: dt_date
+        self,
+        camera: CameraInfo,
+        day: dt_date,
+        event_types: set[str] | None = None,
+        folders_seen: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Return descriptors for every wanted clip on one camera-day.
 
         Browses the media source only - that is the fast Reolink call. It is
         *resolving* a clip for playback that is slow, which is exactly what
         this cache exists to avoid.
+
+        Pass ``event_types`` to override the configured filter, or an empty set
+        to accept everything; ``folders_seen`` collects the trigger folders the
+        day actually has, which diagnostics use to explain an empty result.
         """
         day_id = media_uri(
             f"DAY|{camera.entry_id}|{camera.channel}|{self.stream}"
@@ -590,7 +599,7 @@ class ReolinkClipCacheCoordinator:
             _LOGGER.debug("No recordings for %s on %s (%s)", camera.name, day, err)
             return []
 
-        wanted = set(self.event_types)
+        wanted = set(self.event_types) if event_types is None else event_types
         descriptors: dict[str, dict[str, Any]] = {}
 
         # NVRs expose per-trigger subfolders; hubs and standalone cameras list
@@ -606,7 +615,9 @@ class ReolinkClipCacheCoordinator:
                 trigger = normalise_trigger(
                     bare_identifier(folder.media_content_id).split("|")[-1]
                 )
-                if trigger not in wanted:
+                if folders_seen is not None:
+                    folders_seen.append(trigger)
+                if wanted and trigger not in wanted:
                     continue
                 try:
                     folder_result = await async_browse_media(
@@ -619,7 +630,7 @@ class ReolinkClipCacheCoordinator:
                     self._collect(descriptors, camera, child, day, trigger)
         else:
             for child in day_result.children or []:
-                self._collect(descriptors, camera, child, day, None, wanted)
+                self._collect(descriptors, camera, child, day, None, wanted or None)
 
         return sorted(
             descriptors.values(), key=lambda item: item["start"], reverse=True
@@ -1357,17 +1368,68 @@ class ReolinkClipCacheCoordinator:
             "cameras": {},
         }
 
+        today = dt_util.now().date()
+
         for camera in cameras:
+            entry: dict[str, Any] = {}
+            report["cameras"][camera.name] = entry
+
+            # Which days the NVR admits to having, which also proves whether
+            # browsing works at all.
             try:
-                clips = await self.async_list_day(camera, dt_util.now().date())
+                dates = await self.async_dates(camera.key)
+                entry["days_with_recordings"] = [item["date"] for item in dates[:7]]
             except Exception as err:  # noqa: BLE001
-                report["cameras"][camera.name] = {"error": f"listing failed: {err}"}
-                continue
-            if not clips:
-                report["cameras"][camera.name] = {"error": "no clips found today"}
+                entry["days_with_recordings"] = f"listing days failed: {err}"
+                dates = []
+
+            # Run early enough in the morning and today has nothing yet, so
+            # walk back until a real recording turns up.
+            candidates = [today - timedelta(days=offset) for offset in range(DIAGNOSE_DAYS)]
+            candidates += [
+                day
+                for item in dates
+                if (day := dt_date.fromisoformat(item["date"])) not in candidates
+            ]
+
+            descriptor = None
+            folders: list[str] = []
+            unfiltered = 0
+            for day in candidates:
+                try:
+                    # Ignore the configured event types here: if the day has
+                    # recordings the filter is excluding, that is the answer.
+                    clips = await self.async_list_day(
+                        camera, day, event_types=set(), folders_seen=folders
+                    )
+                except Exception as err:  # noqa: BLE001
+                    entry["error"] = f"listing {day} failed: {err}"
+                    break
+                if not clips:
+                    continue
+
+                unfiltered = len(clips)
+                wanted = set(self.event_types)
+                matching = [
+                    clip for clip in clips if set(clip["event_types"]) & wanted
+                ]
+                entry["tested_day"] = day.isoformat()
+                entry["clips_on_day"] = unfiltered
+                entry["clips_matching_event_types"] = len(matching)
+                descriptor = (matching or clips)[0]
+                break
+
+            if folders:
+                entry["trigger_folders_present"] = sorted(set(folders))
+
+            if descriptor is None:
+                entry.setdefault(
+                    "error",
+                    f"no recordings at all in the last {DIAGNOSE_DAYS} days or on "
+                    "any day the NVR lists - the day listing came back empty",
+                )
                 continue
 
-            descriptor = clips[0]
             routes: dict[str, str] = {}
             for type_name in VOD_TYPE_LADDER:
                 url = await self._async_direct_source(descriptor, type_name)
@@ -1383,11 +1445,10 @@ class ReolinkClipCacheCoordinator:
                 else "could not be resolved"
             )
 
-            report["cameras"][camera.name] = {
-                "clip": descriptor.get("title"),
-                "start": descriptor.get("start"),
-                "routes": routes,
-            }
+            entry["clip"] = descriptor.get("title")
+            entry["start"] = descriptor.get("start")
+            entry["event_types"] = descriptor.get("event_types")
+            entry["routes"] = routes
             _LOGGER.warning("Clip cache diagnosis for %s: %s", camera.name, routes)
 
         return report
