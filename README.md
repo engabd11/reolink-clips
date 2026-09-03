@@ -1,4 +1,4 @@
-# Reolink Clip Cache
+# Reolink Clip Cache (under development)
 
 **Instant playback for your Reolink NVR event clips in Home Assistant.**
 
