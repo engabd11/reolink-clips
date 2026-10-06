@@ -1048,7 +1048,7 @@ class ReolinkClipsCard extends HTMLElement {
       :host {
         display: block;
         --onyx:        #050506;
-        --card-bg:     linear-gradient(180deg, #0B0C0E 0%, #000 62%);
+        --card-bg:     #000;
         --coffee-800:  #141518;
         --taupe:       #D9A85C;
         --taupe-soft:  #F0D2A0;
@@ -1115,7 +1115,7 @@ class ReolinkClipsCard extends HTMLElement {
       }
       :host([theme="soft-dark"]) {
         --onyx:        #0A0A0A;
-        --card-bg:     linear-gradient(180deg, #121212 0%, #0A0A0A 70%);
+        --card-bg:     #0A0A0A;
         --coffee-800:  #1B1B1B;
         --taupe:       #B3A08C;
         --taupe-soft:  #D6C7B3;
@@ -1151,6 +1151,8 @@ class ReolinkClipsCard extends HTMLElement {
         content: ""; position: absolute; inset: -40% 30% auto -30%; height: 90%; z-index: -1; pointer-events: none;
         background: radial-gradient(closest-side, color-mix(in srgb, var(--taupe) 16%, transparent), transparent);
       }
+      /* Dark and soft dark are for OLED panels: true black, no tinted bloom. */
+      :host([theme="dark"]) .card::before, :host([theme="soft-dark"]) .card::before { display: none; }
       .card:focus-visible { border-color: var(--line-strong); box-shadow: 0 0 0 2px color-mix(in srgb, var(--taupe) 40%, transparent); }
 
       .header { display: flex; flex-direction: column; gap: 8px; }
