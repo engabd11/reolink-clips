@@ -1,5 +1,5 @@
 /**
- * Reolink Clips Card v2.1 (Cyborg dark and coffee themes)
+ * Reolink Clips Card v2.1 (Cyborg dark, coffee and dark neon themes)
  *
  * Companion card for the Reolink Clip Cache integration. A single
  * `reolink_clip_cache/clips` call returns a whole camera-day with signed local
@@ -16,7 +16,7 @@
  *   autoplay: false
  */
 
-const CARD_VERSION = '2.1.0';
+const CARD_VERSION = '2.1.1';
 
 // Signed clip and thumbnail URLs live for 30 minutes; refresh the list before then
 // so a wall tablet left on this card keeps working.
@@ -119,7 +119,8 @@ class ReolinkClipsCard extends HTMLElement {
       theme: 'dark',
       ...config,
     };
-    this.setAttribute('theme', this._config.theme === 'coffee' ? 'coffee' : 'dark');
+    const t = String(this._config.theme || '').toLowerCase().replace(/[\s_]+/g, '-');
+    this.setAttribute('theme', t === 'coffee' ? 'coffee' : t === 'dark-neon' || t === 'neon' ? 'dark-neon' : 'dark');
     // Accept the 1.x shape (a list of {name, sensors}) as well as plain keys.
     this._cameraFilter = (this._config.cameras || [])
       .map((camera) => (typeof camera === 'string' ? camera : camera && camera.name))
@@ -1091,6 +1092,29 @@ class ReolinkClipsCard extends HTMLElement {
         --c-clay:  #E8A42C;
       }
 
+      :host([theme="dark-neon"]) {
+        --onyx:        #0A0B0F;
+        --card-bg:     radial-gradient(120% 70% at 0% 0%, rgba(6,182,212,.10), transparent 55%), linear-gradient(180deg, #0F1219 0%, #0A0B0F 70%);
+        --coffee-800:  #141823;
+        --taupe:       #06B6D4;
+        --taupe-soft:  #67E8F9;
+        --on-accent:   #031A1F;
+        --fg:          rgba(255,255,255,.95);
+        --fg-dim:      rgba(255,255,255,.70);
+        --fg-muted:    rgba(255,255,255,.45);
+        --line:        rgba(255,255,255,.08);
+        --line-strong: rgba(6,182,212,.30);
+        --glass:       rgba(255,255,255,.05);
+        --glass2:      rgba(255,255,255,.08);
+        --c-taupe: rgba(255,255,255,.62);
+        --c-sand:  #06B6D4;
+        --c-rust:  #3B82F6;
+        --c-moss:  #10B981;
+        --c-clay:  #F59E0B;
+        --c-cache: #10B981;
+      }
+      :host([theme="dark-neon"]) .card { border-color: rgba(6,182,212,.22); box-shadow: 0 0 0 1px rgba(6,182,212,.05), 0 0 26px -8px rgba(6,182,212,.35), 0 30px 70px -30px rgba(0,0,0,.9); }
+
       .card {
         position: relative; isolation: isolate; overflow: hidden;
         background: var(--card-bg);
@@ -1361,6 +1385,7 @@ class ReolinkClipsCardEditor extends HTMLElement {
         selector: { select: { mode: 'dropdown', options: [
           { value: 'dark', label: 'Dark (CAMusic OLED)' },
           { value: 'coffee', label: 'Coffee (warm)' },
+          { value: 'dark-neon', label: 'Dark neon' },
         ] } },
       },
       { name: 'title', selector: { text: {} } },
