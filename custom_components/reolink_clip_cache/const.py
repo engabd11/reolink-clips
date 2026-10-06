@@ -8,7 +8,7 @@ from typing import Final
 from homeassistant.const import Platform
 
 DOMAIN: Final = "reolink_clip_cache"
-VERSION: Final = "2.0.0"
+VERSION: Final = "2.1.0"
 
 PLATFORMS: Final = [Platform.SENSOR]
 
@@ -123,6 +123,10 @@ FFMPEG_TIMEOUT: Final = 60
 
 # How long a signed clip URL handed to the card stays valid.
 SIGNED_URL_TTL: Final = 1800
+
+# Seconds to wait before caching a clip someone just played from the NVR, so the
+# download does not compete with their stream for the NVR's playback sessions.
+ON_DEMAND_CACHE_DELAY: Final = 90
 
 # ── Storage ──────────────────────────────────────────────────────────────
 

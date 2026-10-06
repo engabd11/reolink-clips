@@ -1,4 +1,4 @@
-# Reolink Clip Cache (under development)
+# Reolink Clip Cache
 
 **Instant playback for your Reolink NVR event clips in Home Assistant.**
 
@@ -81,6 +81,7 @@ Everything is optional; the defaults work.
 
 ```yaml
 type: custom:reolink-clips-card
+theme: dark                     # dark | coffee
 title: Events
 cameras: [carport, back_door]   # omit for every discovered camera
 default_event_type: all         # all | person | vehicle | animal | package | visitor
@@ -90,11 +91,19 @@ autoplay: false                 # play the newest clip on load
 
 | Option | Default | Description |
 |---|---|---|
+| `theme` | `dark` | `dark` is the CAMusic OLED look, `coffee` the warm espresso look, matching [Cyborg Cards](https://github.com/engabd11/cyborg-cards) |
 | `title` | `Events` | Card heading |
 | `cameras` | all | Camera keys to show, in tab order. Camera names also work. |
 | `default_event_type` | `all` | Filter selected when the card loads |
 | `thumbnails` | `true` | Show the filmstrip and prefetch adjacent clips |
 | `autoplay` | `false` | Start the newest clip automatically |
+
+### Playback
+
+- A cached clip starts at once from local storage.
+- A clip that is not cached yet streams from the NVR when you press Play, so browsing the list never ties up the NVR. It caches itself shortly after, so the next play is instant.
+- Fullscreen uses the same player, so nothing downloads twice.
+- If a clip will not play, the card says why and offers Try again. A clip that downloads but will not decode is almost always H.265: set the integration to the low resolution stream.
 
 ### Integration options
 

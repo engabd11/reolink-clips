@@ -16,7 +16,7 @@
         "data_description": {
           "cameras": "Leave empty to cache every Reolink camera.",
           "event_types": "Motion is deliberately not offered: it fires far too often to be worth caching.",
-          "stream": "Low resolution is much smaller and caches faster. If every download fails, try the other one - some NVRs will not serve downloads for one of the streams.",
+          "stream": "Low resolution is H.264, small and plays in every browser. High resolution is usually H.265, which Firefox and many phones and tablets cannot play. If every download fails, try the other stream, since some NVRs serve downloads for only one of them.",
           "cache_days": "Clips older than this are deleted automatically.",
           "max_cache_size_mb": "Once the cache exceeds this, the oldest clips are removed first.",
           "sweep_minutes": "A detection also triggers a check shortly after the event ends."
@@ -47,7 +47,7 @@
         "data_description": {
           "cameras": "Leave empty to cache every Reolink camera.",
           "event_types": "Motion is deliberately not offered: it fires far too often to be worth caching.",
-          "stream": "Low resolution is much smaller and caches faster. If every download fails, try the other one - some NVRs will not serve downloads for one of the streams.",
+          "stream": "Low resolution is H.264, small and plays in every browser. High resolution is usually H.265, which Firefox and many phones and tablets cannot play. If every download fails, try the other stream, since some NVRs serve downloads for only one of them.",
           "cache_days": "Clips older than this are deleted automatically.",
           "max_cache_size_mb": "Once the cache exceeds this, the oldest clips are removed first.",
           "sweep_minutes": "A detection also triggers a check shortly after the event ends."

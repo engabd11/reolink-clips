@@ -48,8 +48,8 @@ EVENT_TYPE_OPTIONS = [
 ]
 
 STREAM_OPTIONS = [
-    {"value": "sub", "label": "Low resolution (smaller, caches faster)"},
-    {"value": "main", "label": "High resolution (best picture, much larger)"},
+    {"value": "sub", "label": "Low resolution (H.264, plays in every browser)"},
+    {"value": "main", "label": "High resolution (often H.265, plays only where the device decodes it)"},
 ]
 
 
