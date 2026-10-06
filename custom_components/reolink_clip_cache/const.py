@@ -8,7 +8,7 @@ from typing import Final
 from homeassistant.const import Platform
 
 DOMAIN: Final = "reolink_clip_cache"
-VERSION: Final = "2.1.1"
+VERSION: Final = "2.1.2"
 
 PLATFORMS: Final = [Platform.SENSOR]
 

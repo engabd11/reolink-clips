@@ -91,7 +91,7 @@ autoplay: false                 # play the newest clip on load
 
 | Option | Default | Description |
 |---|---|---|
-| `theme` | `dark` | `dark` is the CAMusic OLED look, `coffee` the warm espresso look, `dark-neon` the blue-black glass with cyan glow, `soft-dark` onyx with cream text and muted earth colours, matching [Cyborg Cards](https://github.com/engabd11/cyborg-cards) |
+| `theme` | `dark` | `dark` is the CAMusic OLED look, `coffee` the warm espresso look, `dark-neon` the blue-black glass with cyan glow, `soft-dark` neutral black with cream text and muted earth colours, matching [Cyborg Cards](https://github.com/engabd11/cyborg-cards) |
 | `title` | `Events` | Card heading |
 | `cameras` | all | Camera keys to show, in tab order. Camera names also work. |
 | `default_event_type` | `all` | Filter selected when the card loads |

@@ -16,7 +16,7 @@
  *   autoplay: false
  */
 
-const CARD_VERSION = '2.1.1';
+const CARD_VERSION = '2.1.2';
 
 // Signed clip and thumbnail URLs live for 30 minutes; refresh the list before then
 // so a wall tablet left on this card keeps working.
@@ -1114,19 +1114,19 @@ class ReolinkClipsCard extends HTMLElement {
         --c-cache: #10B981;
       }
       :host([theme="soft-dark"]) {
-        --onyx:        #0D0C0B;
-        --card-bg:     linear-gradient(180deg, #151412 0%, #0D0C0B 70%);
-        --coffee-800:  #1E1C1A;
+        --onyx:        #0A0A0A;
+        --card-bg:     linear-gradient(180deg, #121212 0%, #0A0A0A 70%);
+        --coffee-800:  #1B1B1B;
         --taupe:       #B3A08C;
         --taupe-soft:  #D6C7B3;
-        --on-accent:   #171614;
+        --on-accent:   #121212;
         --fg:          #ECE4D6;
         --fg-dim:      #BDB09C;
         --fg-muted:    #8A7E6D;
-        --line:        rgba(154,136,115,.20);
-        --line-strong: rgba(154,136,115,.35);
-        --glass:       rgba(236,228,214,.035);
-        --glass2:      rgba(236,228,214,.06);
+        --line:        rgba(255,255,255,.08);
+        --line-strong: rgba(255,255,255,.16);
+        --glass:       rgba(255,255,255,.035);
+        --glass2:      rgba(255,255,255,.06);
         --c-taupe: #BDB09C;
         --c-sand:  #C9B58E;
         --c-rust:  #B86B4A;
