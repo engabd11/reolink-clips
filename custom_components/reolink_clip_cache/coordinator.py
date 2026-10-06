@@ -52,6 +52,8 @@ from .const import (
     CONF_MAX_CACHE_MB,
     CONF_STREAM,
     CONF_SWEEP_MINUTES,
+    CAMERA_BACKOFF_MINUTES,
+    CLIP_FAILURE_LIMIT,
     CONSECUTIVE_FAILURE_LIMIT,
     DEFAULT_CACHE_DAYS,
     DEFAULT_EVENT_TYPES,
@@ -213,8 +215,15 @@ class ReolinkClipCacheCoordinator:
         self._unsub_detection: CALLBACK_TYPE | None = None
         self._pending_sweeps: dict[str, CALLBACK_TYPE] = {}
         self._base_url: str | None = None
-        # camera key -> the VOD request type that actually works for it
+        # camera key -> the download route that actually works for it
         self._vod_types: dict[str, str] = {}
+        # camera key -> (paused until, how many sweeps in a row gave up)
+        self._backoff: dict[str, tuple[datetime, int]] = {}
+        # clip id -> sweeps that failed to download it
+        self._clip_failures: dict[str, int] = {}
+        # why the last download attempt failed, for one summary warning per clip
+        self._last_error = ""
+        self._last_status: int | None = None
         self._shutdown = False
 
     # ── Options ────────────────────────────────────────────────────────
@@ -480,10 +489,13 @@ class ReolinkClipCacheCoordinator:
         self,
         camera_key: str | None = None,
         days: list[dt_date] | None = None,
+        force: bool = False,
     ) -> int:
         """Cache every event clip not already held locally.
 
-        Returns the number of clips newly cached.
+        ``force`` (the sweep_now service) ignores a camera's back off and
+        retries clips that failed before. Returns the number of clips newly
+        cached.
         """
         if self._shutdown:
             return 0
@@ -502,19 +514,30 @@ class ReolinkClipCacheCoordinator:
         async with self._sweep_lock:
             for camera in targets:
                 for day in days:
-                    cached += await self._async_sweep_camera(camera, day)
+                    cached += await self._async_sweep_camera(camera, day, force)
 
         if cached:
             self._schedule_save()
             async_dispatcher_send(self.hass, SIGNAL_INDEX_UPDATED)
         return cached
 
-    async def _async_sweep_camera(self, camera: CameraInfo, day: dt_date) -> int:
+    async def _async_sweep_camera(
+        self, camera: CameraInfo, day: dt_date, force: bool = False
+    ) -> int:
         """Diff one camera-day against the index and cache what is missing."""
         now = dt_util.utcnow()
         marker = f"{camera.key}|{day.isoformat()}"
-        if (last := self._last_sweep.get(marker)) and now - last < SWEEP_COOLDOWN:
-            return 0
+        if not force:
+            if (last := self._last_sweep.get(marker)) and now - last < SWEEP_COOLDOWN:
+                return 0
+            paused = self._backoff.get(camera.key)
+            if paused and now < paused[0]:
+                _LOGGER.debug(
+                    "Sweep: %s is paused after failed downloads until %s",
+                    camera.name,
+                    paused[0],
+                )
+                return 0
         self._last_sweep[marker] = now
 
         try:
@@ -527,6 +550,10 @@ class ReolinkClipCacheCoordinator:
             descriptor
             for descriptor in descriptors
             if not self._is_cached(descriptor["clip_id"])
+            and (
+                force
+                or self._clip_failures.get(descriptor["clip_id"], 0) < CLIP_FAILURE_LIMIT
+            )
         ]
         if not pending:
             return 0
@@ -557,6 +584,7 @@ class ReolinkClipCacheCoordinator:
             if succeeded:
                 cached += 1
                 consecutive_failures = 0
+                self._backoff.pop(camera.key, None)
                 continue
 
             consecutive_failures += 1
@@ -564,10 +592,19 @@ class ReolinkClipCacheCoordinator:
             # an NVR that is refusing everything would tie up the sweep for
             # many minutes. Give up early and try again next time.
             if consecutive_failures >= CONSECUTIVE_FAILURE_LIMIT:
+                level = self._backoff.get(camera.key, (now, 0))[1]
+                minutes = CAMERA_BACKOFF_MINUTES[min(level, len(CAMERA_BACKOFF_MINUTES) - 1)]
+                self._backoff[camera.key] = (
+                    dt_util.utcnow() + timedelta(minutes=minutes),
+                    level + 1,
+                )
                 _LOGGER.warning(
-                    "%s: %d clips failed in a row, abandoning this sweep",
+                    "%s: %d clips failed in a row, so downloads from this camera "
+                    "pause for %d minutes. Run the reolink_clip_cache.diagnose "
+                    "action to see what the NVR is doing",
                     camera.name,
                     consecutive_failures,
+                    minutes,
                 )
                 break
         return cached
@@ -747,7 +784,9 @@ class ReolinkClipCacheCoordinator:
 
                 if not await self._async_download_with_retries(descriptor, part_path):
                     await self.hass.async_add_executor_job(_unlink, part_path)
+                    self._clip_failures[clip_id] = self._clip_failures.get(clip_id, 0) + 1
                     return False
+                self._clip_failures.pop(clip_id, None)
 
                 await self._async_faststart(part_path, clip_path)
                 thumb_ok = await self._async_thumbnail(
@@ -815,17 +854,136 @@ class ReolinkClipCacheCoordinator:
             self._base_url = f"{scheme}://127.0.0.1:{self.hass.http.server_port}"
         return self._base_url
 
-    def _vod_type_order(self, descriptor: dict[str, Any]) -> list[str]:
-        """Return the VOD request types to try for a camera, best first.
+    def _route_order(self, descriptor: dict[str, Any]) -> list[str]:
+        """Return the download routes to try for a camera, best first.
 
-        Home Assistant always asks an NVR for ``Download``, but plenty of NVRs
-        refuse that and hang up, and want the recording prepared through
-        ``NvrDownload`` first. Once one works for a camera it is used on its
-        own.
+        LIBRARY asks reolink-aio to download the clip the way the Reolink
+        integration's own code does: it prepares the recording on an NVR with
+        NvrDownload, sends the request through the shared, logged in session
+        (renewing an expired login rather than failing with 401) and queues
+        behind Home Assistant's other NVR requests. Then the NVR's own URLs,
+        then Home Assistant's playback proxy. The route that last worked for a
+        camera goes first.
         """
-        if known := self._vod_types.get(self._camera_marker(descriptor)):
-            return [known]
-        return list(VOD_TYPE_LADDER)
+        routes = ["LIBRARY", *VOD_TYPE_LADDER, "PROXY"]
+        if (known := self._vod_types.get(self._camera_marker(descriptor))) in routes:
+            routes.remove(known)
+            routes.insert(0, known)
+        return routes
+
+    @staticmethod
+    def _route_label(route: str) -> str:
+        """Describe a route in log messages."""
+        if route == "LIBRARY":
+            return "the Reolink library"
+        if route == "PROXY":
+            return "the Home Assistant proxy"
+        return f"the NVR directly ({route})"
+
+    def _host_api(self, descriptor: dict[str, Any]) -> Any | None:
+        """Return the Reolink integration's API object for a clip, if loaded."""
+        parts = bare_identifier(descriptor["media_content_id"]).split("|", 6)
+        if len(parts) != 7 or parts[0] != "FILE":
+            return None
+        try:
+            from homeassistant.components.reolink.util import get_host
+
+            return get_host(self.hass, parts[1]).api
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _async_library_download(
+        self, descriptor: dict[str, Any], dest: Path, max_bytes: int | None = None
+    ) -> int:
+        """Download a clip through reolink-aio's own download_vod.
+
+        ``max_bytes`` stops early (used by diagnose). Returns bytes written.
+        """
+        parts = bare_identifier(descriptor["media_content_id"]).split("|", 6)
+        if len(parts) != 7 or parts[0] != "FILE":
+            self._last_error = "not a Reolink recording id"
+            return 0
+        _, _entry_id, channel, stream, filename, start_id, end_id = parts
+        api = self._host_api(descriptor)
+        if api is None:
+            self._last_error = "the Reolink integration is not loaded"
+            return 0
+
+        vod = None
+        written = 0
+        try:
+            async with asyncio.timeout(DOWNLOAD_TIMEOUT):
+                vod = await api.download_vod(
+                    filename,
+                    wanted_filename=f"clip_{start_id}.mp4",
+                    start_time=start_id,
+                    end_time=end_id,
+                    channel=int(channel),
+                    stream=stream,
+                )
+                handle = await self.hass.async_add_executor_job(_open_write, dest)
+                try:
+                    async for chunk in vod.stream.iter_chunked(DOWNLOAD_CHUNK_SIZE):
+                        await self.hass.async_add_executor_job(handle.write, chunk)
+                        written += len(chunk)
+                        if max_bytes and written >= max_bytes:
+                            break
+                finally:
+                    await self.hass.async_add_executor_job(handle.close)
+        except TimeoutError:
+            self._last_error = f"timed out after {DOWNLOAD_TIMEOUT}s"
+            return 0
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # noqa: BLE001 - any library error means try the next route
+            self._last_error = f"{type(err).__name__}: {err}"
+            return 0
+        finally:
+            if vod is not None:
+                try:
+                    vod.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        if not written:
+            self._last_error = "the NVR sent an empty file"
+        return written
+
+    async def _async_try_route(
+        self, route: str, descriptor: dict[str, Any], dest: Path
+    ) -> int:
+        """Try one route once. Returns bytes written; sets _last_error on failure."""
+        self._last_error = ""
+        self._last_status = None
+        if route == "LIBRARY":
+            return await self._async_library_download(descriptor, dest)
+        if route == "PROXY":
+            source = await self._async_source_url(descriptor["media_content_id"])
+            if source is None:
+                self._last_error = "the clip could not be resolved"
+                return 0
+            return await self._async_download(source, dest, label=self._route_label(route))
+
+        url = await self._async_direct_source(descriptor, route)
+        if url is None:
+            self._last_error = "not offered for this recording"
+            return 0
+        written = await self._async_download(
+            url, dest, headers=DIRECT_HEADERS, label=self._route_label(route)
+        )
+        if not written and self._last_status == 401:
+            # The login token in the URL went stale (Home Assistant renews its
+            # session now and then). Renew it and ask once more.
+            if (api := self._host_api(descriptor)) is not None:
+                try:
+                    await api.expire_session(unsubscribe=False)
+                except Exception:  # noqa: BLE001
+                    pass
+                if url := await self._async_direct_source(descriptor, route):
+                    await self.hass.async_add_executor_job(_unlink, dest)
+                    written = await self._async_download(
+                        url, dest, headers=DIRECT_HEADERS, label=self._route_label(route)
+                    )
+        return written
 
     @staticmethod
     def _camera_marker(descriptor: dict[str, Any]) -> str:
@@ -877,66 +1035,45 @@ class ReolinkClipCacheCoordinator:
     async def _async_download_with_retries(
         self, descriptor: dict[str, Any], dest: Path
     ) -> int:
-        """Fetch a clip, trying the NVR directly before Home Assistant's proxy.
+        """Fetch a clip, trying each route in turn, and remember what worked.
 
-        The proxy hands our request straight to the NVR over a pooled
-        connection with a five second read timeout, which is where "Server
-        disconnected" comes from. Fetching the NVR's own URL ourselves removes
-        that hop, refuses connection reuse and allows a longer read window.
+        Each failed route is logged at debug level; a clip that cannot be
+        fetched at all gets one warning listing what every route said.
         """
         marker = self._camera_marker(descriptor)
+        reasons: dict[str, str] = {}
         for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
-            tried_anything = False
-            for type_name in self._vod_type_order(descriptor):
-                direct = await self._async_direct_source(descriptor, type_name)
-                if direct is None:
-                    continue
-                tried_anything = True
-                written = await self._async_download(
-                    direct,
-                    dest,
-                    headers=DIRECT_HEADERS,
-                    label=f"the NVR directly ({type_name})",
-                )
+            for route in self._route_order(descriptor):
+                written = await self._async_try_route(route, descriptor, dest)
                 if written:
-                    if self._vod_types.get(marker) != type_name:
+                    if self._vod_types.get(marker) != route:
                         _LOGGER.info(
-                            "Using the %s request type for %s",
-                            type_name,
+                            "Downloading clips for %s through %s",
                             descriptor.get("camera_name") or marker,
+                            self._route_label(route),
                         )
-                        self._vod_types[marker] = type_name
+                        self._vod_types[marker] = route
                     return written
+                reasons[route] = self._last_error or "failed"
+                _LOGGER.debug(
+                    "Clip download through %s failed: %s",
+                    self._route_label(route),
+                    reasons[route],
+                )
                 await self.hass.async_add_executor_job(_unlink, dest)
 
-            source = await self._async_source_url(descriptor["media_content_id"])
-            if source is None:
-                if not tried_anything:
-                    return 0
-            elif written := await self._async_download(
-                source, dest, label="the Home Assistant proxy"
-            ):
-                return written
-
-            await self.hass.async_add_executor_job(_unlink, dest)
             if attempt < DOWNLOAD_ATTEMPTS:
                 delay = DOWNLOAD_RETRY_BACKOFF[
                     min(attempt - 1, len(DOWNLOAD_RETRY_BACKOFF) - 1)
                 ]
-                _LOGGER.debug(
-                    "Retrying clip download in %ss (attempt %d of %d)",
-                    delay,
-                    attempt + 1,
-                    DOWNLOAD_ATTEMPTS,
-                )
                 await asyncio.sleep(delay)
 
         _LOGGER.warning(
-            "Giving up on a clip after %d attempts; it will be retried on a "
-            "later sweep. If this keeps happening for every clip, try the "
-            "other stream in the integration options - some NVRs will not "
-            "serve downloads for one of them",
-            DOWNLOAD_ATTEMPTS,
+            "Could not download the %s %s clip from %s. %s",
+            descriptor.get("camera_name") or marker,
+            descriptor.get("event_type") or "event",
+            descriptor.get("start") or "",
+            "; ".join(f"{self._route_label(r)}: {msg}" for r, msg in reasons.items()),
         )
         return 0
 
@@ -962,12 +1099,10 @@ class ReolinkClipCacheCoordinator:
                             detail = (await response.text())[:400].strip()
                         except Exception:  # noqa: BLE001
                             detail = "<unreadable body>"
-                        _LOGGER.warning(
-                            "Clip download from %s failed: HTTP %s (%s) - %s",
-                            label,
-                            response.status,
-                            response.content_type,
-                            detail or "<empty body>",
+                        self._last_status = response.status
+                        self._last_error = (
+                            f"HTTP {response.status} ({response.content_type})"
+                            f"{f' {detail}' if detail else ''}"
                         )
                         return 0
                     handle = await self.hass.async_add_executor_job(_open_write, dest)
@@ -980,17 +1115,15 @@ class ReolinkClipCacheCoordinator:
                     finally:
                         await self.hass.async_add_executor_job(handle.close)
         except TimeoutError:
-            _LOGGER.warning(
-                "Clip download from %s timed out after %ss", label, DOWNLOAD_TIMEOUT
-            )
+            self._last_error = f"timed out after {DOWNLOAD_TIMEOUT}s"
             return 0
         except ClientError as err:
             # Naming the exception type matters: a dropped connection, a
             # refused one and a bad response all read alike without it.
-            _LOGGER.warning(
-                "Clip download from %s failed: %s: %s", label, type(err).__name__, err
-            )
+            self._last_error = f"{type(err).__name__}: {err}"
             return 0
+        if not written:
+            self._last_error = "empty response"
         return written
 
     async def _async_faststart(self, src: Path, dest: Path) -> None:
@@ -1397,6 +1530,12 @@ class ReolinkClipCacheCoordinator:
         report: dict[str, Any] = {
             "stream": self.stream,
             "event_types": self.event_types,
+            "routes_in_use": dict(self._vod_types),
+            "paused_cameras": {
+                key: until.isoformat()
+                for key, (until, _level) in self._backoff.items()
+                if until > dt_util.utcnow()
+            },
             "cameras": {},
         }
 
@@ -1462,7 +1601,27 @@ class ReolinkClipCacheCoordinator:
                 )
                 continue
 
+            if (api := self._host_api(descriptor)) is not None and "device" not in report:
+                report["device"] = {
+                    key: str(getattr(api, attr, None))
+                    for key, attr in (
+                        ("name", "nvr_name"),
+                        ("model", "model"),
+                        ("hardware", "hardware_version"),
+                        ("firmware", "sw_version"),
+                        ("is_nvr", "is_nvr"),
+                    )
+                }
+
             routes: dict[str, str] = {}
+            probe_path = self._root / "diagnose.part"
+            written = await self._async_library_download(
+                descriptor, probe_path, max_bytes=65536
+            )
+            await self.hass.async_add_executor_job(_unlink, probe_path)
+            routes["library/download_vod"] = (
+                f"OK - {written} bytes" if written else self._last_error or "failed"
+            )
             for type_name in VOD_TYPE_LADDER:
                 url = await self._async_direct_source(descriptor, type_name)
                 routes[f"direct/{type_name}"] = (

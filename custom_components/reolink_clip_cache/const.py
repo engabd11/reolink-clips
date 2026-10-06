@@ -8,7 +8,7 @@ from typing import Final
 from homeassistant.const import Platform
 
 DOMAIN: Final = "reolink_clip_cache"
-VERSION: Final = "2.1.3"
+VERSION: Final = "2.2.0"
 
 PLATFORMS: Final = [Platform.SENSOR]
 
@@ -63,7 +63,7 @@ DEFAULT_SWEEP_MINUTES: Final = 2
 
 # Reolink NVRs drop connections when they are busy, so a clip that fails is
 # retried a few times with a widening gap before it is left for a later sweep.
-DOWNLOAD_ATTEMPTS: Final = 3
+DOWNLOAD_ATTEMPTS: Final = 2
 DOWNLOAD_RETRY_BACKOFF: Final = (5, 20)
 
 # Breathing room between clips so a sweep does not hammer the NVR.
@@ -79,6 +79,14 @@ VOD_TYPE_LADDER: Final = ("DOWNLOAD", "NVR_DOWNLOAD", "PLAYBACK")
 
 # Abandon a sweep once this many clips fail back to back.
 CONSECUTIVE_FAILURE_LIMIT: Final = 3
+
+# After a sweep gives up on a camera, leave that camera alone for this long
+# (minutes, growing with each failed sweep, reset by any success). An NVR that
+# is refusing downloads only gets busier if it is asked again every 2 minutes.
+CAMERA_BACKOFF_MINUTES: Final = (10, 20, 40, 80, 120)
+
+# A clip that failed this many sweeps is skipped until a manual sweep_now.
+CLIP_FAILURE_LIMIT: Final = 3
 
 # ── Timing ───────────────────────────────────────────────────────────────
 
