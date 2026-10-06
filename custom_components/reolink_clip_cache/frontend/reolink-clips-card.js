@@ -16,18 +16,26 @@
  *   autoplay: false
  */
 
-const CARD_VERSION = '2.3.0';
+const CARD_VERSION = '2.3.1';
+// How long Play waits for an uncached clip to be fetched into the cache.
+const CACHE_WAIT_MS = 300000;
 
 // Signed clip and thumbnail URLs live for 30 minutes; refresh the list before then
 // so a wall tablet left on this card keeps working.
-const LIST_REFRESH_MS = 25 * 60 * 1000;
+// How often the clip list is checked while the card is open.
+const LIST_REFRESH_MS = 5 * 60 * 1000;
+// Retry delays while the integration has no cameras or days yet (Home
+// Assistant still starting, or the Reolink integration not ready).
+const RETRY_MS = [3000, 10000, 30000, 60000];
+// A tab that comes back into view after this long reloads the list.
+const STALE_MS = 60 * 1000;
 
 const EVENT_META = {
   person:  { label: 'Person',  color: 'sand'  },
   vehicle: { label: 'Vehicle', color: 'rust'  },
   animal:  { label: 'Animal',  color: 'moss'  },
   package: { label: 'Package', color: 'clay'  },
-  visitor: { label: 'Visitor', color: 'sand'  },
+  visitor: { label: 'Doorbell', color: 'sand'  },
   face:    { label: 'Face',    color: 'sand'  },
   motion:  { label: 'Motion',  color: 'clay'  },
   other:   { label: 'Event',   color: 'taupe' },
@@ -35,7 +43,7 @@ const EVENT_META = {
 
 const PLURALS = {
   all: 'events', person: 'people', vehicle: 'vehicles', animal: 'animals',
-  package: 'packages', visitor: 'visitors', face: 'faces', motion: 'motion events',
+  package: 'packages', visitor: 'doorbell presses', face: 'faces', motion: 'motion events',
 };
 
 const slug = (value) =>
@@ -90,6 +98,16 @@ class ReolinkClipsCard extends HTMLElement {
     this._loadToken = 0;           // newest _loadClips call wins
     this._selectToken = 0;         // newest _selectClip call wins
     this._pendingClip = null;      // uncached clip waiting for Play
+    this._waitingClip = null;      // uncached clip the integration is caching for Play
+    this._waitTimer = null;
+    this._retryTimer = null;       // camera or day list retry
+    this._retries = 0;
+    this._lastLoad = 0;            // when the clip list was last fetched
+    this._todayAtLoad = null;      // "today" when the day list was loaded
+    this._onReady = () => this._checkCameras();
+    this._onVisible = () => {
+      if (document.visibilityState === 'visible' && Date.now() - this._lastLoad > STALE_MS) this._checkCameras();
+    };
     this._docClick = () => this._closeDropdowns();
   }
 
@@ -143,6 +161,7 @@ class ReolinkClipsCard extends HTMLElement {
 
   connectedCallback() {
     document.addEventListener('click', this._docClick);
+    document.addEventListener('visibilitychange', this._onVisible);
     if (this._hass && this._ready) {
       this._subscribe();
       this._startDetectionTicker();
@@ -151,6 +170,13 @@ class ReolinkClipsCard extends HTMLElement {
 
   disconnectedCallback() {
     document.removeEventListener('click', this._docClick);
+    document.removeEventListener('visibilitychange', this._onVisible);
+    if (this._readyConnection) {
+      this._readyConnection.removeEventListener('ready', this._onReady);
+      this._readyConnection = null;
+    }
+    if (this._retryTimer) clearTimeout(this._retryTimer);
+    this._retryTimer = null;
     if (this._detectionTimer) clearInterval(this._detectionTimer);
     this._detectionTimer = null;
     if (this._refreshTimer) clearInterval(this._refreshTimer);
@@ -166,29 +192,92 @@ class ReolinkClipsCard extends HTMLElement {
   async _init() {
     if (!this._hass || !this._config || this._ready) return;
     this._ready = true;
+    // Reload once Home Assistant reconnects, e.g. after a restart.
+    if (this._hass.connection && this._hass.connection.addEventListener) {
+      this._readyConnection = this._hass.connection;
+      this._readyConnection.addEventListener('ready', this._onReady);
+    }
+    await this._start();
+  }
 
+  /** Load the cameras and the first day, retrying while there are none yet. */
+  async _start() {
+    if (this._retryTimer) clearTimeout(this._retryTimer);
+    this._retryTimer = null;
+    let cameras = [];
     try {
       const result = await this._hass.callWS({ type: 'reolink_clip_cache/cameras' });
-      this._cameras = this._applyFilter(result.cameras || []);
+      this._integration = true;
+      cameras = this._applyFilter(result.cameras || []);
     } catch (err) {
-      // Integration missing or not loaded — browse the media source ourselves.
-      this._integration = false;
-      this._cameras = await this._fallbackCameras();
+      if (err && err.code === 'unknown_command') {
+        // Integration not installed: browse the media source ourselves.
+        this._integration = false;
+        cameras = await this._fallbackCameras();
+      }
+      // Anything else (Home Assistant restarting) is retried below.
     }
 
-    if (!this._cameras.length) {
-      this._fail(
-        this._integration
-          ? 'No Reolink cameras found. Check the Reolink integration and that your NVR has a working hard disk.'
-          : 'Reolink Clip Cache is not installed, and no Reolink cameras were found in the media source.',
-      );
+    if (!cameras.length) {
+      if (this._integration === false) {
+        this._fail('Reolink Clip Cache is not installed, and no Reolink cameras were found in the media source.');
+        return;
+      }
+      // Home Assistant may still be starting, or the Reolink integration not ready.
+      this._fail('Waiting for the Reolink cameras…');
+      this._retryLater(() => this._start());
       return;
     }
 
+    this._retries = 0;
+    this._cameras = cameras;
+    if (this._cameraIndex >= cameras.length) this._cameraIndex = 0;
     this._render();
     this._subscribe();
     this._startDetectionTicker();
     await this._loadDates();
+  }
+
+  _retryLater(fn) {
+    if (this._retryTimer) clearTimeout(this._retryTimer);
+    const delay = RETRY_MS[Math.min(this._retries, RETRY_MS.length - 1)];
+    this._retries += 1;
+    this._retryTimer = setTimeout(() => { this._retryTimer = null; fn(); }, delay);
+  }
+
+  /** Rebuild if the integration's cameras changed, otherwise refresh the list. */
+  async _checkCameras() {
+    if (!this._hass || !this._ready) return;
+    if (!this._cameras.length) { this._start(); return; }
+    if (this._integration) {
+      try {
+        const result = await this._hass.callWS({ type: 'reolink_clip_cache/cameras' });
+        const keys = this._applyFilter(result.cameras || []).map((camera) => camera.key).join();
+        if (keys && keys !== this._cameras.map((camera) => camera.key).join()) {
+          this._start();
+          return;
+        }
+      } catch (err) {
+        /* keep what we have */
+      }
+    }
+    this._refreshList();
+  }
+
+  /** Bring the list up to date: new clips, a new day, or a first load. */
+  _refreshList() {
+    if (!this._hass || !this._ready) return;
+    if (!this._cameras.length) { this._start(); return; }
+    const video = this.$('video');
+    // Leave a clip that is playing alone; refresh around it next time.
+    if (video && !video.paused) return;
+    const today = this._todayISO();
+    if (!this._selectedDate || (this._todayAtLoad && today !== this._todayAtLoad && this._selectedDate === this._todayAtLoad)) {
+      // First load failed, or midnight passed while showing "today".
+      this._loadDates();
+      return;
+    }
+    this._loadClips({ silent: true, keepPosition: true });
   }
 
   _applyFilter(cameras) {
@@ -217,20 +306,28 @@ class ReolinkClipsCard extends HTMLElement {
     this._detectionTimer = setInterval(() => this._refreshDetections(true), 30000);
     if (this._refreshTimer) clearInterval(this._refreshTimer);
     if (this._integration) {
-      this._refreshTimer = setInterval(() => {
-        const video = this.$('video');
-        // Leave a clip that is playing alone; refresh around it next time.
-        if (video && !video.paused) return;
-        this._loadClips({ silent: true, keepPosition: true });
-      }, LIST_REFRESH_MS);
+      this._refreshTimer = setInterval(() => this._checkCameras(), LIST_REFRESH_MS);
     }
   }
 
-  _onClipCached(event) {
+  async _onClipCached(event) {
     const camera = this._camera();
     if (!camera || !event.data || event.data.camera !== camera.key) return;
     // A clip we are already showing just became cached, or a new one landed.
-    this._loadClips({ silent: true, keepPosition: true });
+    await this._loadClips({ silent: true, keepPosition: true });
+    // The clip Play was pressed on is ready: play it now.
+    const waiting = this._waitingClip;
+    if (!waiting) return;
+    const index = this._clips.findIndex((clip) => clip.media_content_id === waiting);
+    if (index < 0 || !this._clips[index].url) return;
+    this._stopWaiting();
+    this._selectClip(index, { play: true });
+  }
+
+  _stopWaiting() {
+    this._waitingClip = null;
+    if (this._waitTimer) clearTimeout(this._waitTimer);
+    this._waitTimer = null;
   }
 
   // ── Data loading ────────────────────────────────────────────────────
@@ -254,12 +351,16 @@ class ReolinkClipsCard extends HTMLElement {
 
     if (!this._dates.length) {
       this._setLoading(false);
-      this._fail('No recordings found for this camera.');
+      this._fail('No recordings found for this camera yet.');
       this._renderDates();
+      // The NVR may still be coming up: look again shortly.
+      this._retryLater(() => { if (camera === this._camera()) this._loadDates(); });
       return;
     }
+    this._retries = 0;
 
     const today = this._todayISO();
+    this._todayAtLoad = today;
     const match = this._dates.find((entry) => entry.date === today);
     this._selectedDate = (match || this._dates[0]).date;
     this._renderDates();
@@ -275,6 +376,7 @@ class ReolinkClipsCard extends HTMLElement {
     const token = ++this._loadToken;
     const date = this._selectedDate;
     this._loading = true;
+    this._lastLoad = Date.now();
     if (!silent) this._setLoading(true);
     const previousId = keepPosition && this._clips[this._clipIndex]
       ? this._clips[this._clipIndex].media_content_id
@@ -343,6 +445,7 @@ class ReolinkClipsCard extends HTMLElement {
     const clip = this._clips[index];
     this._currentClipId = null;
     this._pendingClip = null;
+    if (this._waitingClip !== clip.media_content_id) this._stopWaiting();
     this._setError(null);
 
     const video = this.$('video');
@@ -385,9 +488,24 @@ class ReolinkClipsCard extends HTMLElement {
     if (!clip) return false;
     const token = this._selectToken;
     this._setLoading(true);
-    const url = await this._resolve(clip);
+    const { url, caching } = await this._resolve(clip);
     if (token !== this._selectToken) return true;
     this._pendingClip = null;
+    if (caching) {
+      // This NVR cannot stream it, so the integration is fetching it into the
+      // cache; _onClipCached plays it the moment it lands.
+      this._waitingClip = clip.media_content_id;
+      this._setHint('Fetching this clip from the NVR. It plays as soon as it is ready.');
+      if (this._waitTimer) clearTimeout(this._waitTimer);
+      this._waitTimer = setTimeout(() => {
+        if (this._waitingClip !== clip.media_content_id) return;
+        this._stopWaiting();
+        this._setLoading(false);
+        this._setHint('');
+        this._setError('Still fetching this clip from the NVR. Try again in a minute.');
+      }, CACHE_WAIT_MS);
+      return true;
+    }
     if (!url) {
       this._setLoading(false);
       this._setError('This clip could not be loaded from the NVR.');
@@ -409,9 +527,9 @@ class ReolinkClipsCard extends HTMLElement {
           type: 'media_source/resolve_media',
           media_content_id: clip.media_content_id,
         });
-        return resolved.url;
+        return { url: resolved.url, caching: false };
       } catch (err) {
-        return null;
+        return { url: null, caching: false };
       }
     }
     try {
@@ -420,14 +538,15 @@ class ReolinkClipsCard extends HTMLElement {
         media_content_id: clip.media_content_id,
         clip_id: clip.clip_id || null,
       });
+      if (result && result.caching) return { url: null, caching: true };
       if (result && result.url) {
         clip.url = result.cached ? result.url : null;
-        return result.url;
+        return { url: result.url, caching: false };
       }
     } catch (err) {
       /* fall through */
     }
-    return null;
+    return { url: null, caching: false };
   }
 
   _prefetchNeighbours() {

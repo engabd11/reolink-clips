@@ -72,6 +72,7 @@ def make(tmp: pathlib.Path, api: FakeApi) -> mod.ReolinkClipCacheCoordinator:
     coord = mod.ReolinkClipCacheCoordinator.__new__(mod.ReolinkClipCacheCoordinator)
     coord.hass = types.SimpleNamespace(async_add_executor_job=run_in_executor)
     coord._vod_types = {}
+    coord._cameras = {}
     coord._native_files = {}
     coord._segments = {}
     coord._segments_dir = tmp / "segments"
@@ -160,6 +161,49 @@ async def main() -> None:
     written = await coord._async_try_route("NATIVE_DOWNLOAD", dict(descriptor), tmp / "d.part")
     check("without ffmpeg the segment is not even fetched",
           written == 0 and not fetched and "ffmpeg" in coord._last_error, coord._last_error)
+
+    # Playing an uncached clip on an NVR that only answers by native name.
+    coord = make(tmp, api)
+    coord._cameras = {
+        "back_door": types.SimpleNamespace(key="back_door", entry_id="entry", channel="0"),
+        "carport": types.SimpleNamespace(key="carport", entry_id="entry", channel="2"),
+    }
+    cases = {None: False, "DOWNLOAD": False, "NVR_DOWNLOAD": False, "LIBRARY": False,
+             "NATIVE_DOWNLOAD": True, "NATIVE_FLV": True, "FLV": True, "DOWNLOAD/HTTP": True}
+    got = {}
+    for route, _want in cases.items():
+        coord._vod_types = {"carport": route} if route else {}
+        got[route] = bool(coord._needs_cache_to_play("entry", "carport"))
+    check("only routes Home Assistant's player never uses mean caching to play",
+          got == cases, str(got))
+
+    coord._vod_types = {"carport": "NATIVE_DOWNLOAD"}
+    back_door = {"media_content_id": "media-source://reolink/FILE|entry|0|sub|x|20261005225732|20261005225742", "camera": "back_door"}
+    check("a camera with nothing cached yet borrows its NVR's route",
+          coord._route_order(back_door)[0] == "NATIVE_DOWNLOAD" and coord._needs_cache_to_play("entry", "back_door"),
+          str(coord._route_order(back_door)[:3]))
+    check("but not another NVR's", not coord._needs_cache_to_play("other", "front"))
+
+    started: list[str] = []
+
+    def background(_hass, coro, name):
+        started.append(name)
+        coro.close()
+
+    coord.entry = types.SimpleNamespace(async_create_background_task=background)
+    coord._index = {}
+
+    async def no_resolve(*_a, **_k):
+        raise AssertionError("must not hand the card a proxy URL")
+
+    real_resolve = mod.async_resolve_media
+    mod.async_resolve_media = no_resolve
+    try:
+        result = await coord.async_resolve(media_content_id=back_door["media_content_id"])
+    finally:
+        mod.async_resolve_media = real_resolve
+    check("Play on such a clip starts caching and tells the card so",
+          result.get("caching") is True and result.get("url") is None and len(started) == 1, str(result))
 
     # NATIVE_DOWNLOAD with ffmpeg: one segment fetch serves both clips in it.
     ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
