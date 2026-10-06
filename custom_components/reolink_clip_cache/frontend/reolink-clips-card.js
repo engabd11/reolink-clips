@@ -1114,8 +1114,8 @@ class ReolinkClipsCard extends HTMLElement {
         --c-cache: #10B981;
       }
       :host([theme="soft-dark"]) {
-        --onyx:        #0A0A0A;
-        --card-bg:     #0A0A0A;
+        --onyx:        #000;
+        --card-bg:     #000;
         --coffee-800:  #1B1B1B;
         --taupe:       #B3A08C;
         --taupe-soft:  #D6C7B3;
