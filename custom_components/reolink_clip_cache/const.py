@@ -112,12 +112,20 @@ FLV_FALLBACK_SECONDS: Final = 120
 # a temporary fragment_*.mp4 name that its Download then refuses
 # (home-assistant/core#179099). Native names are hour-long segments, so
 # NATIVE_FLV streams from the clip's offset into the segment, and
-# NATIVE_DOWNLOAD fetches the segment and cuts the clip out of it.
+# NATIVE_DOWNLOAD fetches the segment once and cuts every clip it holds out
+# of it.
 NATIVE_FLV: Final = "NATIVE_FLV"
 NATIVE_DOWNLOAD: Final = "NATIVE_DOWNLOAD"
 NATIVE_ROUTES: Final = (NATIVE_FLV, NATIVE_DOWNLOAD)
 # Fetching a whole segment takes longer than one clip.
 NATIVE_DOWNLOAD_TIMEOUT: Final = 600
+# Segments are kept briefly for the other clips they hold, then deleted.
+SEGMENTS_DIR_NAME: Final = "segments"
+SEGMENTS_KEPT: Final = 2
+SEGMENT_KEEP_MINUTES: Final = 30
+# A segment still being recorded is only reused if fetched this long after
+# the clip ended.
+SEGMENT_SETTLE_SECONDS: Final = 15
 
 # Abandon a sweep once this many clips fail back to back.
 CONSECUTIVE_FAILURE_LIMIT: Final = 3

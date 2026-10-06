@@ -80,6 +80,10 @@ from .const import (
     NATIVE_DOWNLOAD_TIMEOUT,
     NATIVE_FLV,
     NATIVE_ROUTES,
+    SEGMENT_KEEP_MINUTES,
+    SEGMENT_SETTLE_SECONDS,
+    SEGMENTS_DIR_NAME,
+    SEGMENTS_KEPT,
     MAX_CLIPS_PER_SWEEP,
     MAX_CONCURRENT_DOWNLOADS,
     OK_STATUSES,
@@ -288,6 +292,9 @@ class ReolinkClipCacheCoordinator:
         self._root = Path(hass.config.path(STORAGE_DIR_NAME))
         self._clips_dir = self._root / CLIPS_DIR_NAME
         self._thumbs_dir = self._root / THUMBS_DIR_NAME
+        self._segments_dir = self._root / SEGMENTS_DIR_NAME
+        # Recording segments fetched for NATIVE_DOWNLOAD, by segment key.
+        self._segments: dict[str, dict[str, Any]] = {}
 
         # clip_id -> clip record (a descriptor plus cache state)
         self._index: dict[str, dict[str, Any]] = {}
@@ -373,9 +380,11 @@ class ReolinkClipCacheCoordinator:
         self._unsubs.append(async_at_started(self.hass, self._async_started))
 
     def _make_dirs(self) -> None:
-        """Create the cache directories (executor)."""
+        """Create the cache directories and drop stale segments (executor)."""
         self._clips_dir.mkdir(parents=True, exist_ok=True)
         self._thumbs_dir.mkdir(parents=True, exist_ok=True)
+        if self._segments_dir.exists():
+            shutil.rmtree(self._segments_dir, ignore_errors=True)
 
     async def _async_started(self, _hass: HomeAssistant) -> None:
         """Discover cameras and start the sweep loop."""
@@ -417,6 +426,9 @@ class ReolinkClipCacheCoordinator:
             cancel()
         self._pending_sweeps.clear()
         await self._store.async_save({"clips": self._index})
+        await self.hass.async_add_executor_job(
+            shutil.rmtree, self._segments_dir, True
+        )
 
     # ── Discovery ──────────────────────────────────────────────────────
 
@@ -873,15 +885,13 @@ class ReolinkClipCacheCoordinator:
                 clip_path = self.clip_path(clip_id)
                 part_path = clip_path.with_suffix(".part")
 
-                descriptor.pop("_trim", None)
                 if not await self._async_download_with_retries(descriptor, part_path):
                     await self.hass.async_add_executor_job(_unlink, part_path)
                     self._clip_failures[clip_id] = self._clip_failures.get(clip_id, 0) + 1
                     return False
                 self._clip_failures.pop(clip_id, None)
 
-                trim = descriptor.pop("_trim", None)
-                if not await self._async_faststart(part_path, clip_path, trim):
+                if not await self._async_faststart(part_path, clip_path):
                     _LOGGER.warning(
                         "Could not store the %s clip from %s: %s",
                         descriptor.get("camera_name") or descriptor["camera"],
@@ -967,7 +977,9 @@ class ReolinkClipCacheCoordinator:
         then Home Assistant's playback proxy. The route that last worked for a
         camera goes first.
         """
-        routes = ["LIBRARY", NATIVE_FLV, *DIRECT_ROUTES, NATIVE_DOWNLOAD, "PROXY"]
+        nvr_download = [r for r in DIRECT_ROUTES if split_route(r)[0] == "NVR_DOWNLOAD"]
+        others = [r for r in DIRECT_ROUTES if r not in nvr_download]
+        routes = ["LIBRARY", NATIVE_FLV, *nvr_download, NATIVE_DOWNLOAD, *others, "PROXY"]
         if (known := self._vod_types.get(self._camera_marker(descriptor))) in routes:
             routes.remove(known)
             routes.insert(0, known)
@@ -1075,7 +1087,9 @@ class ReolinkClipCacheCoordinator:
             native = await self._async_native_file(descriptor)
             if native is None:
                 return 0
-            request_type, plain_http = ("FLV" if route == NATIVE_FLV else "DOWNLOAD"), False
+            if route == NATIVE_DOWNLOAD:
+                return await self._async_segment_clip(descriptor, native, dest)
+            request_type, plain_http = "FLV", False
         else:
             request_type, plain_http = split_route(route)
         name = native["name"] if native else None
@@ -1088,11 +1102,7 @@ class ReolinkClipCacheCoordinator:
                 url = with_seek(url, native["offset"])
             return await self._async_flv_download(url, descriptor, dest)
         written = await self._async_download(
-            url,
-            dest,
-            headers=DIRECT_HEADERS,
-            label=self._route_label(route),
-            timeout=NATIVE_DOWNLOAD_TIMEOUT if native else None,
+            url, dest, headers=DIRECT_HEADERS, label=self._route_label(route)
         )
         if not written and self._last_status == 401:
             # The login token in the URL went stale (Home Assistant renews its
@@ -1107,16 +1117,105 @@ class ReolinkClipCacheCoordinator:
                 ):
                     await self.hass.async_add_executor_job(_unlink, dest)
                     written = await self._async_download(
-                        url,
-                        dest,
-                        headers=DIRECT_HEADERS,
-                        label=self._route_label(route),
-                        timeout=NATIVE_DOWNLOAD_TIMEOUT if native else None,
+                        url, dest, headers=DIRECT_HEADERS, label=self._route_label(route)
                     )
-        if written and native:
-            # A whole segment: _async_cache_clip cuts the clip out of it.
-            descriptor["_trim"] = (native["offset"], self._clip_seconds(descriptor))
         return written
+
+    async def _async_segment_clip(
+        self, descriptor: dict[str, Any], native: dict[str, Any], dest: Path
+    ) -> int:
+        """Cut a clip out of its native recording segment, fetched once.
+
+        Returns the clip's size in bytes; sets _last_error on failure.
+        """
+        if not (binary := self._ffmpeg_binary()):
+            self._last_error = "ffmpeg is needed to cut a clip out of the NVR's recording"
+            return 0
+        segment = await self._async_segment(descriptor, native)
+        if segment is None:
+            return 0
+        seconds = self._clip_seconds(descriptor)
+        ok = await self._run_ffmpeg(
+            binary,
+            "-y",
+            "-ss",
+            str(native["offset"]),
+            "-i",
+            str(segment),
+            *(["-t", str(seconds)] if seconds else []),
+            "-c",
+            "copy",
+            "-f",
+            "mp4",
+            str(dest),
+        )
+        size = await self.hass.async_add_executor_job(_size_of, dest) if ok else 0
+        if not size:
+            await self.hass.async_add_executor_job(_unlink, dest)
+            self._last_error = "ffmpeg could not cut the clip out of the recording"
+        return size
+
+    async def _async_segment(
+        self, descriptor: dict[str, Any], native: dict[str, Any]
+    ) -> Path | None:
+        """Return the local copy of a clip's native segment, fetching it if needed.
+
+        A copy is reused for the segment's other clips, unless it was fetched
+        before this clip ended (the hour may still have been recording).
+        """
+        parts = bare_identifier(descriptor["media_content_id"]).split("|", 6)
+        entry_id, channel, stream, end_id = parts[1], parts[2], parts[3], parts[6]
+        key = f"{entry_id}|{channel}|{stream}|{native['name']}"
+        clip_end = _parse_reolink_time(end_id)
+        held = self._segments.get(key)
+        if (
+            held
+            and clip_end is not None
+            and held["fetched"] >= clip_end + timedelta(seconds=SEGMENT_SETTLE_SECONDS)
+            and await self.hass.async_add_executor_job(_size_of, held["path"])
+        ):
+            return held["path"]
+
+        await self._async_prune_segments()
+        path = self._segments_dir / f"{hashlib.sha1(key.encode()).hexdigest()[:16]}.mp4"
+        part = path.with_suffix(".part")
+        label = self._route_label(NATIVE_DOWNLOAD)
+        fetched = dt_util.now()
+        written = 0
+        for attempt in range(2):
+            url = await self._async_direct_source(descriptor, "DOWNLOAD", False, native["name"])
+            if url is None:
+                self._last_error = "not offered for this recording"
+                return None
+            self._last_status = None
+            written = await self._async_download(
+                url, part, headers=DIRECT_HEADERS, label=label, timeout=NATIVE_DOWNLOAD_TIMEOUT
+            )
+            if written or self._last_status != 401 or attempt:
+                break
+            # A stale login token: renew it and ask once more.
+            if (api := self._host_api(descriptor)) is not None:
+                try:
+                    await api.expire_session(unsubscribe=False)
+                except Exception:  # noqa: BLE001
+                    pass
+        if not written:
+            await self.hass.async_add_executor_job(_unlink, part)
+            return None
+        await self.hass.async_add_executor_job(part.replace, path)
+        self._segments[key] = {"path": path, "fetched": fetched}
+        _LOGGER.debug("Fetched recording segment %s (%d MiB)", native["name"], written >> 20)
+        return path
+
+    async def _async_prune_segments(self) -> None:
+        """Delete old segments, and all but the newest few."""
+        cutoff = dt_util.now() - timedelta(minutes=SEGMENT_KEEP_MINUTES)
+        newest = sorted(self._segments, key=lambda k: self._segments[k]["fetched"], reverse=True)
+        for index, key in enumerate(newest):
+            held = self._segments[key]
+            if index >= SEGMENTS_KEPT - 1 or held["fetched"] < cutoff:
+                await self.hass.async_add_executor_job(_unlink, held["path"])
+                del self._segments[key]
 
     async def _async_native_file(
         self, descriptor: dict[str, Any]
@@ -1368,32 +1467,19 @@ class ReolinkClipCacheCoordinator:
             self._last_error = "empty response"
         return written
 
-    async def _async_faststart(
-        self, src: Path, dest: Path, trim: tuple[int, int | None] | None = None
-    ) -> bool:
+    async def _async_faststart(self, src: Path, dest: Path) -> bool:
         """Move the MP4 index to the front so playback can start immediately.
 
         Without this the browser has to fetch the whole file before the first
         frame, which is a large part of the delay this integration removes.
         An FLV recording is remuxed into MP4 the same way; it is useless to a
         browser as it is, so it fails (returns False) if that cannot be done.
-        ``trim`` is (offset, seconds) to cut a clip out of a whole recording
-        segment; that too fails without ffmpeg, rather than keep the segment.
         """
         head = await self.hass.async_add_executor_job(_read_head, src, 3)
         is_flv = head.startswith(FLV_MAGIC)
 
         if binary := self._ffmpeg_binary():
-            cut_in = ["-ss", str(trim[0])] if trim else []
-            cut_out = ["-t", str(trim[1])] if trim and trim[1] else []
-            base = [
-                "-y",
-                *cut_in,
-                *(["-f", "flv"] if is_flv else []),
-                "-i",
-                str(src),
-                *cut_out,
-            ]
+            base = ["-y", *(["-f", "flv"] if is_flv else []), "-i", str(src)]
             tail = ["-movflags", "+faststart", "-f", "mp4", str(dest)]
             ok = await self._run_ffmpeg(binary, *base, "-c", "copy", *tail)
             if not ok and is_flv:
@@ -1405,13 +1491,9 @@ class ReolinkClipCacheCoordinator:
                 return True
             _LOGGER.debug("Faststart failed for %s, storing as downloaded", src.name)
 
-        if is_flv or trim:
+        if is_flv:
             await self.hass.async_add_executor_job(_unlink, dest)
-            self._last_error = (
-                "ffmpeg could not turn the FLV recording into MP4"
-                if is_flv
-                else "ffmpeg could not cut the clip out of the recording"
-            )
+            self._last_error = "ffmpeg could not turn the FLV recording into MP4"
             return False
         await self.hass.async_add_executor_job(shutil.move, str(src), str(dest))
         return True

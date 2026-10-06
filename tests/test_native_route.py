@@ -6,10 +6,11 @@ by time, but serves its hour-long segments by the name its Search reports.
 
 - The segment holding a clip is found from the Search reply, with the clip's
   offset into it, and looked up once per clip.
-- NATIVE_FLV streams from that offset (FLV seek); NATIVE_DOWNLOAD fetches the
-  segment and asks for the clip to be cut out of it.
-- The cut is done by ffmpeg, and without ffmpeg a segment is never stored.
-- The heavy native download comes late in the route order.
+- NATIVE_FLV streams from that offset (FLV seek). NATIVE_DOWNLOAD fetches the
+  segment once and ffmpeg cuts each clip it holds out of it; a copy fetched
+  before a clip ended is fetched again; at most two segments are kept.
+- Without ffmpeg no segment is fetched.
+- The segment comes after NvrDownload and before a plain Download.
 
     pip install homeassistant && python tests/test_native_route.py
 """
@@ -72,6 +73,8 @@ def make(tmp: pathlib.Path, api: FakeApi) -> mod.ReolinkClipCacheCoordinator:
     coord.hass = types.SimpleNamespace(async_add_executor_job=run_in_executor)
     coord._vod_types = {}
     coord._native_files = {}
+    coord._segments = {}
+    coord._segments_dir = tmp / "segments"
     coord._last_error = ""
     coord._last_status = None
     coord._root = tmp
@@ -103,7 +106,9 @@ async def main() -> None:
     api = FakeApi()
     order = make(tmp, api)._route_order(descriptor)
     check("native FLV is tried right after the library", order[:2] == ["LIBRARY", "NATIVE_FLV"], str(order))
-    check("the whole-segment download comes just before the proxy", order[-2:] == ["NATIVE_DOWNLOAD", "PROXY"], str(order))
+    check("the native segment comes after NvrDownload and before a plain Download",
+          order.index("NVR_DOWNLOAD/HTTP") < order.index("NATIVE_DOWNLOAD") < order.index("DOWNLOAD"), str(order))
+    check("the proxy is last", order[-1] == "PROXY", str(order))
 
     # NATIVE_FLV: native name, seek to the offset, streamed for the clip.
     coord = make(tmp, api)
@@ -127,22 +132,8 @@ async def main() -> None:
     check("NATIVE_FLV asks for FLV by the native name",
           written == 1234 and asked and asked[-1] == ("FLV", False, "1-2-0-01260906055959-00000"), str(asked))
     check("and seeks to the clip", flv_urls and "seek=2225" in flv_urls[-1], str(flv_urls))
-    check("NATIVE_FLV leaves nothing to trim", "_trim" not in descriptor)
-
-    # NATIVE_DOWNLOAD: native name, then the clip is to be cut out.
-    downloads: list[dict] = []
-
-    async def download(url, dest, headers=None, label="", max_seconds=None, timeout=None):
-        downloads.append({"url": url, "timeout": timeout})
-        return 99
-
-    coord._async_download = download
-    written = await coord._async_try_route("NATIVE_DOWNLOAD", descriptor, tmp / "b.part")
-    check("NATIVE_DOWNLOAD fetches the segment by its native name",
-          written == 99 and asked[-1] == ("DOWNLOAD", False, "1-2-0-01260906055959-00000"), str(asked))
-    check("with the longer segment timeout", downloads and downloads[-1]["timeout"] == mod.NATIVE_DOWNLOAD_TIMEOUT, str(downloads))
-    check("and marks the clip to cut out (offset, length)", descriptor.get("_trim") == (2225, 45), str(descriptor.get("_trim")))
-    check("the NVR is searched once per clip", api.searches == 1, str(api.searches))
+    again = await coord._async_native_file(descriptor)
+    check("the NVR is searched once per clip", again is not None and api.searches == 1, str(api.searches))
 
     # No named segment: a clear reason, no request.
     class EmptyApi(FakeApi):
@@ -156,42 +147,83 @@ async def main() -> None:
     check("no named segment: nothing asked of the NVR", written == 0 and len(asked) == n)
     check("and the reason says so", "none with a name" in coord._last_error, coord._last_error)
 
-    # Cutting.
+    # NATIVE_DOWNLOAD without ffmpeg: nothing is fetched or stored.
     coord = make(tmp, api)
     coord._ffmpeg_binary = lambda: None
-    src = tmp / "seg.part"
-    src.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 100)
-    ok = await coord._async_faststart(src, tmp / "seg.mp4", (10, 5))
-    check("without ffmpeg a whole segment is not stored as the clip", ok is False and not (tmp / "seg.mp4").exists(), coord._last_error)
+    fetched: list[str] = []
 
+    async def no_download(url, dest, **kw):
+        fetched.append(url)
+        return 1
+
+    coord._async_download = no_download
+    written = await coord._async_try_route("NATIVE_DOWNLOAD", dict(descriptor), tmp / "d.part")
+    check("without ffmpeg the segment is not even fetched",
+          written == 0 and not fetched and "ffmpeg" in coord._last_error, coord._last_error)
+
+    # NATIVE_DOWNLOAD with ffmpeg: one segment fetch serves both clips in it.
     ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
     if not (ffmpeg and ffprobe):
-        print("  SKIP  cutting a real clip (no ffmpeg/ffprobe)")
-    else:
-        seg = tmp / "real.part"
-        subprocess.run(
-            [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x180:rate=10:duration=12",
-             "-c:v", "libx264", "-g", "10", "-pix_fmt", "yuv420p", "-f", "mp4", str(seg)],
-            check=True,
+        print("  SKIP  cutting real clips (no ffmpeg/ffprobe)")
+        return
+    seg_src = tmp / "segment-source.mp4"
+    subprocess.run(
+        [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x180:rate=10:duration=12",
+         "-c:v", "libx264", "-g", "10", "-pix_fmt", "yuv420p", "-f", "mp4", str(seg_src)],
+        check=True,
+    )
+
+    class SegmentApi(FakeApi):
+        async def request_vod_files(self, *a, **k):
+            self.searches += 1
+            data = {"name": "1-2-0-seg", "StartTime": t(2026, 1, 6, 17, 37, 0), "EndTime": t(2026, 1, 6, 18, 37, 0)}
+            return [], [types.SimpleNamespace(data=data)]
+
+    async def run_ffmpeg(binary, *args):
+        proc = await asyncio.create_subprocess_exec(
+            binary, "-hide_banner", "-loglevel", "error", *args,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
         )
+        await proc.communicate()
+        return proc.returncode == 0
 
-        async def run_ffmpeg(binary, *args):
-            proc = await asyncio.create_subprocess_exec(
-                binary, "-hide_banner", "-loglevel", "error", *args,
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
-            )
-            await proc.communicate()
-            return proc.returncode == 0
-
-        coord._ffmpeg_binary = lambda: ffmpeg
-        coord._run_ffmpeg = run_ffmpeg
-        out = tmp / "cut.mp4"
-        ok = await coord._async_faststart(seg, out, (5, 4))
-        probe = subprocess.run([ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "json", str(out)],
+    def duration_of(path):
+        probe = subprocess.run([ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)],
                                capture_output=True, text=True)
-        duration = float(json.loads(probe.stdout or "{}").get("format", {}).get("duration", 0))
-        check("ffmpeg cuts the clip out of the segment (about 4 s of 12)", ok and 3.5 <= duration <= 5.5, f"{ok} {duration}")
+        return float(json.loads(probe.stdout or "{}").get("format", {}).get("duration", 0))
 
+    coord = make(tmp, SegmentApi())
+    coord._ffmpeg_binary = lambda: ffmpeg
+    coord._run_ffmpeg = run_ffmpeg
+    coord._async_direct_source = direct_source
+    seg_fetches: list[dict] = []
+
+    async def seg_download(url, dest, headers=None, label="", max_seconds=None, timeout=None):
+        seg_fetches.append({"url": url, "timeout": timeout})
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(seg_src, dest)
+        return dest.stat().st_size
+
+    coord._async_download = seg_download
+    first = {"media_content_id": "media-source://reolink/FILE|entry|2|sub|x|20260106173704|20260106173708", "camera": "carport", "clip_id": "c1"}
+    second = {"media_content_id": "media-source://reolink/FILE|entry|2|sub|x|20260106173702|20260106173705", "camera": "carport", "clip_id": "c2"}
+    out1, out2 = tmp / "c1.part", tmp / "c2.part"
+    w1 = await coord._async_try_route("NATIVE_DOWNLOAD", first, out1)
+    w2 = await coord._async_try_route("NATIVE_DOWNLOAD", second, out2)
+    check("the segment is fetched once for both clips", len(seg_fetches) == 1, str(seg_fetches))
+    check("by its native name, with the longer timeout",
+          bool(seg_fetches) and "source=1-2-0-seg" in seg_fetches[0]["url"] and seg_fetches[0]["timeout"] == mod.NATIVE_DOWNLOAD_TIMEOUT, str(seg_fetches))
+    d1 = duration_of(out1) if w1 else 0
+    d2 = duration_of(out2) if w2 else 0
+    check("each clip is cut to its own length (4 s and 3 s of 12)", 3.5 <= d1 <= 5.5 and 2.5 <= d2 <= 4.5, f"{w1} {d1} {w2} {d2} {coord._last_error}")
+
+    # A copy fetched before a clip ended (the hour still recording) is fetched again.
+    for held in coord._segments.values():
+        held["fetched"] = mod._parse_reolink_time("20260106173705")
+    third = dict(first, clip_id="c3")
+    await coord._async_try_route("NATIVE_DOWNLOAD", third, tmp / "c3.part")
+    check("a copy fetched before the clip ended is fetched again", len(seg_fetches) == 2, str(len(seg_fetches)))
+    check("at most two segments are kept", len(list((tmp / "segments").glob("*.mp4"))) <= mod.SEGMENTS_KEPT)
 
 asyncio.run(main())
 print(f"\n{len(FAILURES)} failed" if FAILURES else "\nall passed")
