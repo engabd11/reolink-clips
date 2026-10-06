@@ -8,9 +8,9 @@ from typing import Final
 from homeassistant.const import Platform
 
 DOMAIN: Final = "reolink_clip_cache"
-VERSION: Final = "2.3.0"
+VERSION: Final = "2.3.1"
 
-PLATFORMS: Final = [Platform.SENSOR]
+PLATFORMS: Final = [Platform.BUTTON, Platform.SENSOR]
 
 # ── Reolink integration interop ──────────────────────────────────────────
 
@@ -37,8 +37,9 @@ CACHEABLE_TRIGGERS: Final = [
 DEFAULT_EVENT_TYPES: Final = ["person", "vehicle", "animal"]
 
 # Reolink groups pets and animals under different keys depending on model and
-# HA version; both surface as the same thing to a user.
-TRIGGER_ALIASES: Final = {"pet": "animal", "dog_cat": "animal"}
+# HA version; both surface as the same thing to a user. A doorbell press is the
+# "visitor" sensor, but an NVR files its recordings under a DOORBELL folder.
+TRIGGER_ALIASES: Final = {"pet": "animal", "dog_cat": "animal", "doorbell": "visitor"}
 
 # ── Streams ──────────────────────────────────────────────────────────────
 

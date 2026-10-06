@@ -44,7 +44,7 @@ EVENT_TYPE_OPTIONS = [
     {"value": "vehicle", "label": "Vehicle"},
     {"value": "animal", "label": "Animal"},
     {"value": "package", "label": "Package"},
-    {"value": "visitor", "label": "Visitor"},
+    {"value": "visitor", "label": "Doorbell press"},
     {"value": "face", "label": "Face"},
 ]
 

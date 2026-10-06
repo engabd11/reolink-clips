@@ -45,6 +45,7 @@ def make(tmp: pathlib.Path) -> mod.ReolinkClipCacheCoordinator:
     coord = mod.ReolinkClipCacheCoordinator.__new__(mod.ReolinkClipCacheCoordinator)
     coord.hass = types.SimpleNamespace(async_add_executor_job=run_in_executor)
     coord._vod_types = {}
+    coord._cameras = {}
     coord._backoff = {}
     coord._clip_failures = {}
     coord._last_error = ""

@@ -980,10 +980,42 @@ class ReolinkClipCacheCoordinator:
         nvr_download = [r for r in DIRECT_ROUTES if split_route(r)[0] == "NVR_DOWNLOAD"]
         others = [r for r in DIRECT_ROUTES if r not in nvr_download]
         routes = ["LIBRARY", NATIVE_FLV, *nvr_download, NATIVE_DOWNLOAD, *others, "PROXY"]
-        if (known := self._vod_types.get(self._camera_marker(descriptor))) in routes:
+        entry_id = bare_identifier(descriptor["media_content_id"]).split("|", 2)[1:2]
+        known = self._known_route(entry_id[0] if entry_id else "", self._camera_marker(descriptor))
+        if known in routes:
             routes.remove(known)
             routes.insert(0, known)
         return routes
+
+    def _known_route(self, entry_id: str, camera_key: str | None) -> str | None:
+        """Return the route that last worked for a camera, or for its NVR.
+
+        Cameras on one NVR answer the same way, so a camera that has not
+        cached anything yet starts with the route its siblings use.
+        """
+        if camera_key and (known := self._vod_types.get(camera_key)):
+            return known
+        for camera in self._cameras.values():
+            if camera.entry_id == entry_id and (known := self._vod_types.get(camera.key)):
+                return known
+        return None
+
+    def _needs_cache_to_play(self, entry_id: str, camera_key: str | None) -> bool:
+        """Whether Home Assistant's own player cannot stream this camera's clips.
+
+        Home Assistant's playback proxy asks an NVR for NvrDownload or Download
+        over the integration's own connection. When clips only came through a
+        route it never uses (by native name, FLV, or plain HTTP), streaming an
+        uncached clip from the NVR fails, so caching it is the only way to play.
+        """
+        known = self._known_route(entry_id, camera_key)
+        if not known:
+            return False
+        return (
+            known in NATIVE_ROUTES
+            or split_route(known)[0] == "FLV"
+            or split_route(known)[1]
+        )
 
     @staticmethod
     def _route_label(route: str) -> str:
@@ -1656,6 +1688,23 @@ class ReolinkClipCacheCoordinator:
         async_dispatcher_send(self.hass, SIGNAL_INDEX_UPDATED)
         return len(doomed)
 
+    async def async_clear(self) -> int:
+        """Delete every cached clip, thumbnail and segment. Returns clips removed.
+
+        The next sweep caches clips again from the NVR.
+        """
+        removed = len(self._index)
+        self._index.clear()
+        self._clip_failures.clear()
+        self._segments.clear()
+        await self.hass.async_add_executor_job(
+            _clear_dirs, (self._clips_dir, self._thumbs_dir, self._segments_dir)
+        )
+        _LOGGER.info("Cleared the clip cache (%d clip(s))", removed)
+        await self._store.async_save({"clips": self._index})
+        async_dispatcher_send(self.hass, SIGNAL_INDEX_UPDATED)
+        return removed
+
     # ── Read API (WebSocket / sensors) ─────────────────────────────────
 
     def camera_list(self) -> list[dict[str, Any]]:
@@ -1781,6 +1830,20 @@ class ReolinkClipCacheCoordinator:
             f"{STORAGE_DIR_NAME}_on_demand_{clip_id}",
         )
 
+        parts = bare_identifier(media_content_id).split("|", 6)
+        if len(parts) == 7:
+            camera = next(
+                (
+                    item
+                    for item in self._cameras.values()
+                    if item.entry_id == parts[1] and item.channel == parts[2]
+                ),
+                None,
+            )
+            if self._needs_cache_to_play(parts[1], camera.key if camera else None):
+                # The card waits for the clip_cached event and plays it then.
+                return {"cached": False, "clip_id": clip_id, "url": None, "caching": True}
+
         try:
             media = await async_resolve_media(self.hass, media_content_id, None)
         except Exception as err:  # noqa: BLE001
@@ -1835,7 +1898,7 @@ class ReolinkClipCacheCoordinator:
         if camera is None:
             return
 
-        if self._vod_types.get(camera.key) != "FLV":
+        if not self._needs_cache_to_play(camera.entry_id, camera.key):
             await asyncio.sleep(ON_DEMAND_CACHE_DELAY)
         record = self._index.get(clip_id_for(media_content_id))
         if record and record.get("cached_at"):
@@ -2109,6 +2172,18 @@ def _read_head(path: Path, size: int) -> bytes:
             return handle.read(size)
     except OSError:
         return b""
+
+
+def _clear_dirs(directories: tuple[Path, ...]) -> None:
+    """Empty each directory, keeping the directory itself (executor)."""
+    for directory in directories:
+        if not directory.exists():
+            continue
+        for path in directory.iterdir():
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
 
 
 def _unlink(path: Path) -> None:

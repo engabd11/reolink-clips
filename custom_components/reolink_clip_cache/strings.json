@@ -56,6 +56,14 @@
     }
   },
   "entity": {
+    "button": {
+      "sweep_now": {
+        "name": "Sweep now"
+      },
+      "clear_cache": {
+        "name": "Clear cache"
+      }
+    },
     "sensor": {
       "cache_size": {
         "name": "Cache size"

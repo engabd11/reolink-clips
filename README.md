@@ -84,7 +84,7 @@ type: custom:reolink-clips-card
 theme: dark                     # dark | coffee | dark-neon | soft-dark
 title: Events
 cameras: [carport, back_door]   # omit for every discovered camera
-default_event_type: all         # all | person | vehicle | animal | package | visitor
+default_event_type: all         # all | person | vehicle | animal | package | visitor (doorbell)
 thumbnails: true                # thumbnail filmstrip under the player
 autoplay: false                 # play the newest clip on load
 ```
@@ -102,6 +102,7 @@ autoplay: false                 # play the newest clip on load
 
 - A cached clip starts at once from local storage.
 - A clip that is not cached yet streams from the NVR when you press Play, so browsing the list never ties up the NVR. It caches itself shortly after, so the next play is instant.
+- On an NVR that Home Assistant's own player cannot stream from (see Troubleshooting), Play fetches the clip into the cache instead: the card shows *Fetching this clip from the NVR* and plays it the moment it is ready.
 - Fullscreen uses the same player, so nothing downloads twice.
 - If a clip will not play, the card says why and offers Try again. A clip that downloads but will not decode is almost always H.265: set the integration to the low resolution stream.
 
@@ -110,7 +111,7 @@ autoplay: false                 # play the newest clip on load
 | Option | Default | Description |
 |---|---|---|
 | Cameras | all | Which cameras to cache. Leave empty for every discovered camera. |
-| Event types | Person, Vehicle, Animal | What to cache. Motion is not offered — it fires far too often to be worth caching. |
+| Event types | Person, Vehicle, Animal | What to cache. **Doorbell press** is a doorbell's ring (Reolink's visitor event). Motion is not offered — it fires far too often to be worth caching. |
 | Stream | Low resolution | `sub` caches fast and small; `main` is the full-quality recording. **If every download fails, try the other one** — some NVRs will not serve downloads for one of the streams. |
 | Keep clips for | 7 days | Age limit |
 | Maximum cache size | 2048 MB | Size ceiling; oldest clips are evicted first |
@@ -135,11 +136,14 @@ endpoint instead, and the card is handed short-lived signed URLs.
 Rough sizing at low resolution: ~2 MB per clip, so 5 events/day across 4 cameras is about
 40 MB/day, or ~280 MB at the default 7-day retention.
 
-## Sensors
+## Sensors and buttons
 
 - **Cache size** — megabytes currently held
 - **Cached clips** — number of clips, with a per-camera breakdown and the most recent clip
   in its attributes
+- **Sweep now** — look for clips across every day the cache keeps, straight away, even for
+  a camera paused after failed downloads
+- **Clear cache** — delete every cached clip and thumbnail. The next sweep caches them again
 
 ## What this is not
 

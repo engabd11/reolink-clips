@@ -16,7 +16,9 @@
  *   autoplay: false
  */
 
-const CARD_VERSION = '2.3.0';
+const CARD_VERSION = '2.3.1';
+// How long Play waits for an uncached clip to be fetched into the cache.
+const CACHE_WAIT_MS = 180000;
 
 // Signed clip and thumbnail URLs live for 30 minutes; refresh the list before then
 // so a wall tablet left on this card keeps working.
@@ -27,7 +29,7 @@ const EVENT_META = {
   vehicle: { label: 'Vehicle', color: 'rust'  },
   animal:  { label: 'Animal',  color: 'moss'  },
   package: { label: 'Package', color: 'clay'  },
-  visitor: { label: 'Visitor', color: 'sand'  },
+  visitor: { label: 'Doorbell', color: 'sand'  },
   face:    { label: 'Face',    color: 'sand'  },
   motion:  { label: 'Motion',  color: 'clay'  },
   other:   { label: 'Event',   color: 'taupe' },
@@ -35,7 +37,7 @@ const EVENT_META = {
 
 const PLURALS = {
   all: 'events', person: 'people', vehicle: 'vehicles', animal: 'animals',
-  package: 'packages', visitor: 'visitors', face: 'faces', motion: 'motion events',
+  package: 'packages', visitor: 'doorbell presses', face: 'faces', motion: 'motion events',
 };
 
 const slug = (value) =>
@@ -90,6 +92,8 @@ class ReolinkClipsCard extends HTMLElement {
     this._loadToken = 0;           // newest _loadClips call wins
     this._selectToken = 0;         // newest _selectClip call wins
     this._pendingClip = null;      // uncached clip waiting for Play
+    this._waitingClip = null;      // uncached clip the integration is caching for Play
+    this._waitTimer = null;
     this._docClick = () => this._closeDropdowns();
   }
 
@@ -226,11 +230,24 @@ class ReolinkClipsCard extends HTMLElement {
     }
   }
 
-  _onClipCached(event) {
+  async _onClipCached(event) {
     const camera = this._camera();
     if (!camera || !event.data || event.data.camera !== camera.key) return;
     // A clip we are already showing just became cached, or a new one landed.
-    this._loadClips({ silent: true, keepPosition: true });
+    await this._loadClips({ silent: true, keepPosition: true });
+    // The clip Play was pressed on is ready: play it now.
+    const waiting = this._waitingClip;
+    if (!waiting) return;
+    const index = this._clips.findIndex((clip) => clip.media_content_id === waiting);
+    if (index < 0 || !this._clips[index].url) return;
+    this._stopWaiting();
+    this._selectClip(index, { play: true });
+  }
+
+  _stopWaiting() {
+    this._waitingClip = null;
+    if (this._waitTimer) clearTimeout(this._waitTimer);
+    this._waitTimer = null;
   }
 
   // ── Data loading ────────────────────────────────────────────────────
@@ -343,6 +360,7 @@ class ReolinkClipsCard extends HTMLElement {
     const clip = this._clips[index];
     this._currentClipId = null;
     this._pendingClip = null;
+    if (this._waitingClip !== clip.media_content_id) this._stopWaiting();
     this._setError(null);
 
     const video = this.$('video');
@@ -385,9 +403,24 @@ class ReolinkClipsCard extends HTMLElement {
     if (!clip) return false;
     const token = this._selectToken;
     this._setLoading(true);
-    const url = await this._resolve(clip);
+    const { url, caching } = await this._resolve(clip);
     if (token !== this._selectToken) return true;
     this._pendingClip = null;
+    if (caching) {
+      // This NVR cannot stream it, so the integration is fetching it into the
+      // cache; _onClipCached plays it the moment it lands.
+      this._waitingClip = clip.media_content_id;
+      this._setHint('Fetching this clip from the NVR. It plays as soon as it is ready.');
+      if (this._waitTimer) clearTimeout(this._waitTimer);
+      this._waitTimer = setTimeout(() => {
+        if (this._waitingClip !== clip.media_content_id) return;
+        this._stopWaiting();
+        this._setLoading(false);
+        this._setHint('');
+        this._setError('Still fetching this clip from the NVR. Try again in a minute.');
+      }, CACHE_WAIT_MS);
+      return true;
+    }
     if (!url) {
       this._setLoading(false);
       this._setError('This clip could not be loaded from the NVR.');
@@ -409,9 +442,9 @@ class ReolinkClipsCard extends HTMLElement {
           type: 'media_source/resolve_media',
           media_content_id: clip.media_content_id,
         });
-        return resolved.url;
+        return { url: resolved.url, caching: false };
       } catch (err) {
-        return null;
+        return { url: null, caching: false };
       }
     }
     try {
@@ -420,14 +453,15 @@ class ReolinkClipsCard extends HTMLElement {
         media_content_id: clip.media_content_id,
         clip_id: clip.clip_id || null,
       });
+      if (result && result.caching) return { url: null, caching: true };
       if (result && result.url) {
         clip.url = result.cached ? result.url : null;
-        return result.url;
+        return { url: result.url, caching: false };
       }
     } catch (err) {
       /* fall through */
     }
-    return null;
+    return { url: null, caching: false };
   }
 
   _prefetchNeighbours() {

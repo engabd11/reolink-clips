@@ -57,6 +57,9 @@ try:
 except Exception as err:  # noqa: BLE001
     check("an older entry with pet validates", False, str(err))
 
+from custom_components.reolink_clip_cache.coordinator import normalise_trigger
+
+check("an NVR's DOORBELL folder counts as a doorbell press (visitor)", normalise_trigger("DOORBELL") == "visitor")
 check("pet maps to animal", flow.clean_event_types(["person", "pet"]) == ["person", "animal"], str(flow.clean_event_types(["person", "pet"])))
 check("unknown values are dropped", flow.clean_event_types(["person", "motion", "bogus"]) == ["person"])
 check("an empty choice falls back to the defaults", flow.clean_event_types([]) == [v for v in DEFAULT_EVENT_TYPES if v in offered])

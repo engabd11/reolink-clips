@@ -36,6 +36,8 @@ def make_coordinator(signed: list) -> mod.ReolinkClipCacheCoordinator:
     coord = mod.ReolinkClipCacheCoordinator.__new__(mod.ReolinkClipCacheCoordinator)
     coord.hass = types.SimpleNamespace()
     coord._index = {}
+    coord._vod_types = {}
+    coord._cameras = {}
     started = []
 
     def create_task(_hass, coro, _name):
