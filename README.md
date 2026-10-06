@@ -87,6 +87,9 @@ cameras: [carport, back_door]   # omit for every discovered camera
 default_event_type: all         # all | person | vehicle | animal | package | visitor (doorbell)
 thumbnails: true                # thumbnail filmstrip under the player
 autoplay: false                 # play the newest clip on load
+tab_labels: auto                # auto | names | icons
+camera_icons:                   # optional: your own icon per camera
+  carport: mdi:garage
 ```
 
 | Option | Default | Description |
@@ -97,6 +100,8 @@ autoplay: false                 # play the newest clip on load
 | `default_event_type` | `all` | Filter selected when the card loads |
 | `thumbnails` | `true` | Show the filmstrip and prefetch adjacent clips |
 | `autoplay` | `false` | Start the newest clip automatically |
+| `tab_labels` | `auto` | Camera tabs sit on one row. `auto` shows names while they fit and icons when they would not; `names` or `icons` fixes one |
+| `camera_icons` | guessed | An icon per camera key. Otherwise it is guessed from the camera's name (door, doorbell, carport, yard, alley, gate…), falling back to a CCTV icon |
 
 ### Playback
 
@@ -104,6 +109,9 @@ autoplay: false                 # play the newest clip on load
 - A clip that is not cached yet streams from the NVR when you press Play, so browsing the list never ties up the NVR. It caches itself shortly after, so the next play is instant.
 - On an NVR that Home Assistant's own player cannot stream from (see Troubleshooting), Play fetches the clip into the cache instead: the card shows *Fetching this clip from the NVR* and plays it the moment it is ready.
 - Fullscreen uses the same player, so nothing downloads twice.
+- The speaker button mutes and unmutes; the choice is remembered on that device.
+- Zoom with the mouse wheel or a two-finger pinch (up to 5×) and drag to look around. Tap the zoom chip to go back to 1×. Changing clip resets the zoom.
+- The header shows how many clips are cached for the card's cameras, and how many the day on show has.
 - If a clip will not play, the card says why and offers Try again. A clip that downloads but will not decode is almost always H.265: set the integration to the low resolution stream.
 
 ### Integration options

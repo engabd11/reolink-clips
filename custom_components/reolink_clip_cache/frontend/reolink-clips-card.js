@@ -16,9 +16,14 @@
  *   autoplay: false
  */
 
-const CARD_VERSION = '2.3.1';
+const CARD_VERSION = '2.3.2';
 // How long Play waits for an uncached clip to be fetched into the cache.
 const CACHE_WAIT_MS = 300000;
+// Zoom limits for the player (pinch, wheel).
+const ZOOM_MAX = 5;
+const ZOOM_STEP = 1.15;
+// Remembers the mute choice on this device.
+const MUTE_KEY = 'reolink-clips-card:muted';
 
 // Signed clip and thumbnail URLs live for 30 minutes; refresh the list before then
 // so a wall tablet left on this card keeps working.
@@ -44,6 +49,29 @@ const EVENT_META = {
 const PLURALS = {
   all: 'events', person: 'people', vehicle: 'vehicles', animal: 'animals',
   package: 'packages', visitor: 'doorbell presses', face: 'faces', motion: 'motion events',
+};
+
+// Icons guessed from a camera's name, first match wins, for when the tab names
+// do not fit on one row. camera_icons in the card config overrides them.
+const CAMERA_ICON_RULES = [
+  [/doorbell|door\s*bell|bell/, 'mdi:doorbell-video'],
+  [/garage|carport|car\s*port|driveway|drive|parking|car/, 'mdi:car'],
+  [/back\s*door|front\s*door|side\s*door|door|entry|entrance/, 'mdi:door'],
+  [/gate/, 'mdi:gate'],
+  [/alley|lane|street|road|side/, 'mdi:road-variant'],
+  [/back\s*yard|yard|garden|lawn|patio|deck/, 'mdi:pine-tree'],
+  [/pool/, 'mdi:pool'],
+  [/porch|front|house|home/, 'mdi:home'],
+  [/baby|nursery|kid/, 'mdi:baby-face-outline'],
+  [/living|lounge|family/, 'mdi:sofa'],
+  [/kitchen/, 'mdi:silverware-fork-knife'],
+  [/office|study/, 'mdi:desk'],
+  [/shed|workshop/, 'mdi:hammer-wrench'],
+];
+const guessCameraIcon = (name) => {
+  const text = String(name || '').toLowerCase();
+  const rule = CAMERA_ICON_RULES.find(([pattern]) => pattern.test(text));
+  return rule ? rule[1] : 'mdi:cctv';
 };
 
 const slug = (value) =>
@@ -101,6 +129,12 @@ class ReolinkClipsCard extends HTMLElement {
     this._waitingClip = null;      // uncached clip the integration is caching for Play
     this._waitTimer = null;
     this._retryTimer = null;       // camera or day list retry
+    this._cachedTotal = null;      // clips cached for this card's cameras
+    this._zoom = { s: 1, x: 0, y: 0 };
+    this._pointers = new Map();    // active pointers on the player, for pinch and pan
+    this._dragged = false;         // a pan just ended: do not treat it as a tap
+    this._muted = false;
+    try { this._muted = localStorage.getItem(MUTE_KEY) === '1'; } catch (err) { /* private mode */ }
     this._retries = 0;
     this._lastLoad = 0;            // when the clip list was last fetched
     this._todayAtLoad = null;      // "today" when the day list was loaded
@@ -177,6 +211,8 @@ class ReolinkClipsCard extends HTMLElement {
     }
     if (this._retryTimer) clearTimeout(this._retryTimer);
     this._retryTimer = null;
+    if (this._tabObserver) this._tabObserver.disconnect();
+    this._tabObserver = null;
     if (this._detectionTimer) clearInterval(this._detectionTimer);
     this._detectionTimer = null;
     if (this._refreshTimer) clearInterval(this._refreshTimer);
@@ -400,6 +436,7 @@ class ReolinkClipsCard extends HTMLElement {
     this._loading = false;
     this._setLoading(false);
     this._applyFilterAndRender(previousId);
+    this._loadTotal();
   }
 
   _applyFilterAndRender(restoreId) {
@@ -451,6 +488,7 @@ class ReolinkClipsCard extends HTMLElement {
     const video = this.$('video');
     const placeholder = this.$('placeholder');
     const playBtn = this.$('play-btn');
+    this._setZoom(1, 0, 0);
 
     this._renderClipChrome(clip);
     this._renderNav();
@@ -630,6 +668,135 @@ class ReolinkClipsCard extends HTMLElement {
   // ── Fullscreen ──────────────────────────────────────────────────────
 
   /** Fullscreen the player itself: the same <video>, so nothing downloads twice. */
+  _cameraIcon(camera) {
+    const chosen = (this._config.camera_icons || {})[camera.key];
+    return chosen || guessCameraIcon(camera.name);
+  }
+
+  /** Names on the tabs while they fit on one row, icons when they would not. */
+  _fitTabs() {
+    const bar = this.shadowRoot.querySelector('.camera-tabs');
+    if (!bar) return;
+    // Outside Home Assistant (no ha-icon) an initial stands in for the icon.
+    bar.classList.toggle('no-ha-icon', !customElements.get('ha-icon'));
+    const mode = this._config.tab_labels || 'auto';
+    if (mode !== 'auto') {
+      bar.classList.toggle('icons', mode === 'icons');
+      return;
+    }
+    bar.classList.remove('icons');
+    if (!bar.clientWidth) return;
+    // Compare each name's full text width with its box; scrollWidth rounds to
+    // whole pixels and misses an ellipsis by a fraction of one.
+    const range = document.createRange();
+    const cut = [...bar.querySelectorAll('.tab-name')].some((name) => {
+      range.selectNodeContents(name);
+      return range.getBoundingClientRect().width > name.getBoundingClientRect().width + 0.01;
+    });
+    bar.classList.toggle('icons', cut);
+  }
+
+  _toggleMute() {
+    this._muted = !this._muted;
+    try { localStorage.setItem(MUTE_KEY, this._muted ? '1' : '0'); } catch (err) { /* private mode */ }
+    this._renderMute();
+  }
+
+  _renderMute() {
+    const video = this.$('video');
+    const btn = this.$('mute-btn');
+    if (video) video.muted = this._muted;
+    if (!btn) return;
+    btn.setAttribute('aria-pressed', String(this._muted));
+    btn.title = this._muted ? 'Unmute' : 'Mute';
+    btn.setAttribute('aria-label', btn.title);
+    btn.innerHTML = this._muted
+      ? '<svg viewBox="0 0 24 24"><path d="M11 5 6 9H2v6h4l5 4V5z"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>'
+      : '<svg viewBox="0 0 24 24"><path d="M11 5 6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a10 10 0 0 1 0 14"/></svg>';
+  }
+
+  /** Zoom to scale s with pan (x, y) in px, kept inside the picture. */
+  _setZoom(scale, x, y) {
+    const player = this.$('player');
+    const video = this.$('video');
+    if (!player || !video) return;
+    const s = Math.min(ZOOM_MAX, Math.max(1, scale));
+    const maxX = ((s - 1) * player.clientWidth) / 2;
+    const maxY = ((s - 1) * player.clientHeight) / 2;
+    this._zoom = {
+      s,
+      x: s === 1 ? 0 : Math.max(-maxX, Math.min(maxX, x)),
+      y: s === 1 ? 0 : Math.max(-maxY, Math.min(maxY, y)),
+    };
+    video.style.transform = s === 1 ? '' : `translate(${this._zoom.x}px, ${this._zoom.y}px) scale(${s})`;
+    player.classList.toggle('zoomed', s > 1);
+    const chip = this.$('zoom-chip');
+    chip.style.display = s > 1 ? 'block' : 'none';
+    chip.textContent = `${s.toFixed(1)}× ✕`;
+  }
+
+  /** Zoom by a factor around a point given relative to the player's centre. */
+  _zoomAt(factor, cx, cy) {
+    const { s, x, y } = this._zoom;
+    const next = Math.min(ZOOM_MAX, Math.max(1, s * factor));
+    const k = next / s;
+    // Keep the point under the cursor or fingers where it is.
+    this._setZoom(next, cx - (cx - x) * k, cy - (cy - y) * k);
+  }
+
+  _wireZoom() {
+    const player = this.$('player');
+    const video = this.$('video');
+    const centre = (clientX, clientY) => {
+      const box = player.getBoundingClientRect();
+      return [clientX - box.left - box.width / 2, clientY - box.top - box.height / 2];
+    };
+
+    player.addEventListener('wheel', (event) => {
+      if (video.style.display === 'none') return;
+      event.preventDefault();
+      this._zoomAt(event.deltaY < 0 ? ZOOM_STEP : 1 / ZOOM_STEP, ...centre(event.clientX, event.clientY));
+    }, { passive: false });
+
+    let pinch = null;   // { dist, scale, mid } while two fingers are down
+    let pan = null;     // { x, y, zx, zy } while one pointer drags a zoomed picture
+    const points = () => [...this._pointers.values()];
+    video.addEventListener('pointerdown', (event) => {
+      this._pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      if (this._pointers.size === 2) {
+        const [a, b] = points();
+        pinch = { dist: Math.hypot(a.x - b.x, a.y - b.y) || 1, scale: this._zoom.s };
+        pan = null;
+      } else if (this._pointers.size === 1 && this._zoom.s > 1) {
+        pan = { x: event.clientX, y: event.clientY, zx: this._zoom.x, zy: this._zoom.y };
+        video.setPointerCapture?.(event.pointerId);
+      }
+    });
+    video.addEventListener('pointermove', (event) => {
+      if (!this._pointers.has(event.pointerId)) return;
+      this._pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      if (pinch && this._pointers.size >= 2) {
+        const [a, b] = points();
+        const dist = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+        const [cx, cy] = centre((a.x + b.x) / 2, (a.y + b.y) / 2);
+        this._zoomAt((pinch.scale * dist) / pinch.dist / this._zoom.s, cx, cy);
+        this._dragged = true;
+      } else if (pan) {
+        const dx = event.clientX - pan.x;
+        const dy = event.clientY - pan.y;
+        if (Math.abs(dx) + Math.abs(dy) > 4) this._dragged = true;
+        this._setZoom(this._zoom.s, pan.zx + dx, pan.zy + dy);
+      }
+    });
+    const release = (event) => {
+      this._pointers.delete(event.pointerId);
+      if (this._pointers.size < 2) pinch = null;
+      if (this._pointers.size === 0) pan = null;
+    };
+    video.addEventListener('pointerup', release);
+    video.addEventListener('pointercancel', release);
+  }
+
   _toggleFullscreen() {
     const player = this.$('player');
     const video = this.$('video');
@@ -695,11 +862,45 @@ class ReolinkClipsCard extends HTMLElement {
 
   _renderSummary() {
     const label = PLURALS[this._eventType] || `${this._eventType}s`;
-    const cached = this._clips.filter((clip) => clip.cached).length;
-    const suffix = this._integration && this._clips.length
-      ? ` · ${cached}/${this._clips.length} cached`
-      : '';
-    this.$('clip-count').textContent = `${this._clips.length} ${label}${suffix}`;
+    const day = this._dayPhrase();
+    const onDay = `${this._clips.length} ${day}`;
+    if (this._integration && this._cachedTotal !== null) {
+      // Everything cached for this card's cameras, then the day on show.
+      this.$('clip-count').textContent = `${this._cachedTotal} cached · ${onDay}`;
+      return;
+    }
+    this.$('clip-count').textContent = `${this._clips.length} ${label}`;
+  }
+
+  /** "today", "yesterday" or "on 5 Oct", for the summary line. */
+  _dayPhrase() {
+    if (!this._selectedDate) return '';
+    const today = this._todayISO();
+    if (this._selectedDate === today) return 'today';
+    const yesterday = new Date(`${today}T12:00:00`);
+    yesterday.setDate(yesterday.getDate() - 1);
+    if (this._selectedDate === this._isoOf(yesterday)) return 'yesterday';
+    const date = new Date(`${this._selectedDate}T12:00:00`);
+    return `on ${date.toLocaleDateString(undefined, { day: 'numeric', month: 'short' })}`;
+  }
+
+  _isoOf(date) {
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+  }
+
+  /** Count the clips cached for this card's cameras. */
+  async _loadTotal() {
+    if (!this._integration || !this._hass) return;
+    try {
+      const status = await this._hass.callWS({ type: 'reolink_clip_cache/status' });
+      const perCamera = status.cameras || {};
+      const names = this._cameras.map((camera) => camera.name);
+      this._cachedTotal = names.reduce((sum, name) => sum + (Number(perCamera[name]) || 0), 0);
+    } catch (err) {
+      this._cachedTotal = null;
+    }
+    if (this._allClips) this._renderSummary();
   }
 
   _renderClipChrome(clip) {
@@ -1032,7 +1233,9 @@ class ReolinkClipsCard extends HTMLElement {
         ${cameras.length > 1 ? `
           <div class="camera-tabs">
             ${cameras.map((camera, i) => `
-              <button class="cam-tab${i === this._cameraIndex ? ' active' : ''}" data-idx="${i}">${esc(camera.name)}</button>
+              <button class="cam-tab${i === this._cameraIndex ? ' active' : ''}" data-idx="${i}" title="${esc(camera.name)}" aria-label="${esc(camera.name)}">
+                <ha-icon icon="${esc(this._cameraIcon(camera))}"></ha-icon><span class="tab-initial">${esc(String(camera.name || '?').trim().charAt(0))}</span><span class="tab-name">${esc(camera.name)}</span>
+              </button>
             `).join('')}
           </div>` : ''}
 
@@ -1069,6 +1272,8 @@ class ReolinkClipsCard extends HTMLElement {
           </div>
           <div class="player-overlay-right"><span class="clip-time-badge" id="clip-time"></span></div>
           <div class="player-cam-label" id="player-cam-label"></div>
+          <button class="zoom-chip" id="zoom-chip" title="Reset zoom" aria-label="Reset zoom" style="display:none"></button>
+          <button class="mute-btn" id="mute-btn" title="Mute" aria-label="Mute" aria-pressed="false"></button>
           <button class="fullscreen-btn" id="fullscreen-btn" title="Fullscreen" aria-label="Fullscreen">
             <svg viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
           </button>
@@ -1130,7 +1335,12 @@ class ReolinkClipsCard extends HTMLElement {
 
     const video = this.$('video');
     this.$('play-btn').addEventListener('click', () => this._play());
-    video.addEventListener('click', () => this._togglePlay());
+    video.addEventListener('click', () => {
+      // The end of a pan is not a tap.
+      if (this._dragged) { this._dragged = false; return; }
+      this._togglePlay();
+    });
+    video.muted = this._muted;
     video.addEventListener('ended', () => this.$('play-btn').classList.remove('hidden'));
     video.addEventListener('error', () => this._onVideoError());
     // Show the spinner whenever playback is waiting on data, and only then.
@@ -1149,6 +1359,20 @@ class ReolinkClipsCard extends HTMLElement {
 
     this.$('fullscreen-btn').addEventListener('click', () => this._toggleFullscreen());
     this.$('player').addEventListener('dblclick', () => this._toggleFullscreen());
+    this.$('mute-btn').addEventListener('click', (event) => { event.stopPropagation(); this._toggleMute(); });
+    this.$('zoom-chip').addEventListener('click', (event) => { event.stopPropagation(); this._setZoom(1, 0, 0); });
+    this._renderMute();
+    this._wireZoom();
+    if (this._tabObserver) this._tabObserver.disconnect();
+    const bar = this.shadowRoot.querySelector('.camera-tabs');
+    if (bar && window.ResizeObserver) {
+      this._tabObserver = new ResizeObserver(() => this._fitTabs());
+      this._tabObserver.observe(bar);
+    }
+    this._fitTabs();
+    // Web fonts can widen the names after the first layout: check again.
+    requestAnimationFrame(() => this._fitTabs());
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => this._fitTabs());
     this.$('fs-prev').addEventListener('click', () => this._prev());
     this.$('fs-next').addEventListener('click', () => this._next());
 
@@ -1321,13 +1545,22 @@ class ReolinkClipsCard extends HTMLElement {
       .refresh-btn:hover { background: var(--glass2); color: var(--fg); }
       .refresh-btn svg { width: 15px; height: 15px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 
-      .camera-tabs { display: grid; grid-template-columns: repeat(${cols}, 1fr); gap: 8px; }
+      /* One row: names while they fit, icons when they would not (or by choice). */
+      .camera-tabs { display: flex; gap: 8px; }
       .cam-tab {
+        flex: 1 1 0; min-width: 0;
+        display: flex; align-items: center; justify-content: center; gap: 6px;
         height: 40px; font-size: 12px; font-weight: 600; letter-spacing: 0.6px;
         text-transform: uppercase; background: transparent; border: 1px solid var(--line);
         border-radius: var(--radius-btn); color: var(--fg-muted); cursor: pointer; transition: all 0.15s; font-family: inherit;
-        overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0 8px;
+        overflow: hidden; white-space: nowrap; padding: 0 8px;
       }
+      .tab-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+      .cam-tab ha-icon, .cam-tab .tab-initial { display: none; }
+      .cam-tab ha-icon { --mdc-icon-size: 20px; }
+      .camera-tabs.icons .tab-name { display: none; }
+      .camera-tabs.icons .cam-tab ha-icon { display: inline-flex; }
+      .camera-tabs.icons.no-ha-icon .cam-tab .tab-initial { display: inline; font-size: 14px; }
       .cam-tab:hover { background: var(--glass); color: var(--fg); }
       .cam-tab.active { background: var(--taupe); color: var(--on-accent); border-color: var(--taupe); box-shadow: 0 6px 16px -6px color-mix(in srgb, var(--taupe) 80%, transparent); }
 
@@ -1426,6 +1659,24 @@ class ReolinkClipsCard extends HTMLElement {
       .player:hover .fullscreen-btn { opacity: 1; }
       @media (hover: none) { .fullscreen-btn { opacity: 0.8; } }
       .fullscreen-btn svg { width: 17px; height: 17px; stroke: #fff; fill: none; stroke-width: 2; }
+      .mute-btn {
+        position: absolute; bottom: 10px; right: 52px; width: 34px; height: 34px;
+        background: rgba(0,0,0,.55); border: 1px solid rgba(255,255,255,.14); border-radius: 10px;
+        cursor: pointer; display: flex; align-items: center; justify-content: center;
+        opacity: 0; transition: opacity 0.2s;
+      }
+      .player:hover .mute-btn, .mute-btn[aria-pressed="true"] { opacity: 1; }
+      @media (hover: none) { .mute-btn { opacity: 0.8; } }
+      .mute-btn svg { width: 17px; height: 17px; stroke: #fff; fill: none; stroke-width: 2; }
+      .zoom-chip {
+        position: absolute; bottom: 10px; right: 94px; height: 34px; padding: 0 10px;
+        background: rgba(0,0,0,.65); border: 1px solid rgba(255,255,255,.18); border-radius: 10px;
+        color: #fff; font: 600 12px 'JetBrains Mono', monospace; cursor: pointer;
+      }
+      .player video { transform-origin: center center; will-change: transform; }
+      .player { touch-action: pan-y; }
+      .player.zoomed { touch-action: none; cursor: grab; }
+      .player.zoomed:active { cursor: grabbing; }
 
       .loading { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,.35); pointer-events: none; }
       .loading.active { display: flex; }
@@ -1558,7 +1809,33 @@ class ReolinkClipsCardEditor extends HTMLElement {
       },
       { name: 'thumbnails', selector: { boolean: {} } },
       { name: 'autoplay', selector: { boolean: {} } },
+      {
+        name: 'tab_labels',
+        selector: { select: { mode: 'dropdown', options: [
+          { value: 'auto', label: 'Names, or icons when they do not fit' },
+          { value: 'names', label: 'Always names' },
+          { value: 'icons', label: 'Always icons' },
+        ] } },
+      },
+      ...(this._iconCameras().length ? [{
+        type: 'expandable',
+        name: 'camera_icons',
+        title: 'Camera icons',
+        schema: this._iconCameras().map((camera) => ({
+          name: camera.key,
+          selector: { icon: { placeholder: guessCameraIcon(camera.name) } },
+        })),
+      }] : []),
     ];
+  }
+
+  /** The cameras the card shows: the chosen ones, or every camera. */
+  _iconCameras() {
+    const chosen = (this._config.cameras || [])
+      .map((camera) => (typeof camera === 'string' ? camera : slug(camera && camera.name)));
+    return chosen.length
+      ? chosen.map((key) => this._cameras.find((camera) => camera.key === key)).filter(Boolean)
+      : this._cameras;
   }
 
   _render() {
@@ -1572,10 +1849,16 @@ class ReolinkClipsCardEditor extends HTMLElement {
         default_event_type: 'Event type shown first',
         thumbnails: 'Show the thumbnail filmstrip',
         autoplay: 'Play the newest clip automatically',
-      }[schema.name] || schema.name);
+        tab_labels: 'Camera tabs',
+      }[schema.name] || (this._cameras.find((camera) => camera.key === schema.name) || {}).name || schema.name);
       this._form.addEventListener('value-changed', (event) => {
+        const config = { ...this._config, ...event.detail.value };
+        // Keep only the icons actually chosen, and none at all if there are none.
+        const icons = Object.fromEntries(Object.entries(config.camera_icons || {}).filter(([, icon]) => icon));
+        if (Object.keys(icons).length) config.camera_icons = icons; else delete config.camera_icons;
+        if (config.tab_labels === 'auto') delete config.tab_labels;
         this.dispatchEvent(new CustomEvent('config-changed', {
-          detail: { config: { ...this._config, ...event.detail.value } },
+          detail: { config },
           bubbles: true, composed: true,
         }));
       });
@@ -1594,7 +1877,9 @@ class ReolinkClipsCardEditor extends HTMLElement {
       default_event_type: 'all',
       thumbnails: true,
       autoplay: false,
+      tab_labels: 'auto',
       ...this._config,
+      camera_icons: this._config.camera_icons || {},
       cameras: (this._config.cameras || [])
         .map((camera) => (typeof camera === 'string' ? camera : slug(camera && camera.name))),
     };
