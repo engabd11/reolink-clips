@@ -41,6 +41,8 @@ jobs:
         run: python tests/test_media_source_ids.py
       - name: Check uncached clips resolve to signed URLs
         run: python tests/test_resolve_signing.py
+      - name: Check the config and options forms always validate
+        run: python tests/test_config_flow_event_types.py
 
   syntax:
     name: Syntax
