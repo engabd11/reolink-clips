@@ -105,6 +105,20 @@ FLV_GRACE_SECONDS: Final = 15
 # Used when a clip's length cannot be worked out from its id.
 FLV_FALLBACK_SECONDS: Final = 120
 
+# Routes that ask the NVR for a recording by its native file name, as its
+# Search command reports it (for example 1-0-0-01260906130000-00000), rather
+# than by time. An RLN8-410 on firmware 3.6.5 hangs up on every other request
+# for a recording, Home Assistant's own player included: NvrDownload hands back
+# a temporary fragment_*.mp4 name that its Download then refuses
+# (home-assistant/core#179099). Native names are hour-long segments, so
+# NATIVE_FLV streams from the clip's offset into the segment, and
+# NATIVE_DOWNLOAD fetches the segment and cuts the clip out of it.
+NATIVE_FLV: Final = "NATIVE_FLV"
+NATIVE_DOWNLOAD: Final = "NATIVE_DOWNLOAD"
+NATIVE_ROUTES: Final = (NATIVE_FLV, NATIVE_DOWNLOAD)
+# Fetching a whole segment takes longer than one clip.
+NATIVE_DOWNLOAD_TIMEOUT: Final = 600
+
 # Abandon a sweep once this many clips fail back to back.
 CONSECUTIVE_FAILURE_LIMIT: Final = 3
 
