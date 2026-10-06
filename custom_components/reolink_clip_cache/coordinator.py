@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 import shutil
 from dataclasses import dataclass, field
 from datetime import date as dt_date, datetime, timedelta
@@ -71,6 +72,8 @@ from .const import (
     EVENT_CLIP_CACHED,
     EVENT_SETTLE_DELAY,
     FFMPEG_TIMEOUT,
+    FLV_FALLBACK_SECONDS,
+    FLV_GRACE_SECONDS,
     MAX_CLIPS_PER_SWEEP,
     MAX_CONCURRENT_DOWNLOADS,
     OK_STATUSES,
@@ -93,6 +96,16 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 SAVE_DELAY = 10
+
+# The FLV route puts the NVR login in the URL, and a token rides on the others.
+_SECRET_PARAMS = re.compile(r"((?:password|token|user)=)[^&\s'\"]*", re.IGNORECASE)
+
+FLV_MAGIC = b"FLV"
+
+
+def redact(text: str) -> str:
+    """Hide credentials that an error message may echo back from a URL."""
+    return _SECRET_PARAMS.sub(r"\1***", text)
 
 
 @dataclass(slots=True)
@@ -788,7 +801,16 @@ class ReolinkClipCacheCoordinator:
                     return False
                 self._clip_failures.pop(clip_id, None)
 
-                await self._async_faststart(part_path, clip_path)
+                if not await self._async_faststart(part_path, clip_path):
+                    _LOGGER.warning(
+                        "Could not store the %s clip from %s: %s",
+                        descriptor.get("camera_name") or descriptor["camera"],
+                        descriptor.get("start") or "",
+                        self._last_error,
+                    )
+                    await self.hass.async_add_executor_job(_unlink, part_path)
+                    self._clip_failures[clip_id] = self._clip_failures.get(clip_id, 0) + 1
+                    return False
                 thumb_ok = await self._async_thumbnail(
                     clip_path, self.thumb_path(clip_id)
                 )
@@ -967,6 +989,8 @@ class ReolinkClipCacheCoordinator:
         if url is None:
             self._last_error = "not offered for this recording"
             return 0
+        if route == "FLV":
+            return await self._async_flv_download(url, descriptor, dest)
         written = await self._async_download(
             url, dest, headers=DIRECT_HEADERS, label=self._route_label(route)
         )
@@ -984,6 +1008,46 @@ class ReolinkClipCacheCoordinator:
                         url, dest, headers=DIRECT_HEADERS, label=self._route_label(route)
                     )
         return written
+
+    async def _async_flv_download(
+        self, url: str, descriptor: dict[str, Any], dest: Path
+    ) -> int:
+        """Record a clip from the NVR's FLV playback stream.
+
+        The stream is read for the clip's length plus a grace period and kept
+        only if it really is FLV; _async_faststart then remuxes it to MP4.
+        """
+        seconds = self._clip_seconds(descriptor)
+        listen = (seconds or FLV_FALLBACK_SECONDS) + FLV_GRACE_SECONDS
+        written = await self._async_download(
+            url,
+            dest,
+            headers=DIRECT_HEADERS,
+            label=self._route_label("FLV"),
+            max_seconds=listen,
+        )
+        if not written:
+            return 0
+        head = await self.hass.async_add_executor_job(_read_head, dest, 64)
+        if not head.startswith(FLV_MAGIC):
+            self._last_error = (
+                "the NVR answered with something other than FLV: "
+                f"{redact(head.decode('utf-8', 'replace')).strip()[:80]!r}"
+            )
+            return 0
+        return written
+
+    @staticmethod
+    def _clip_seconds(descriptor: dict[str, Any]) -> int | None:
+        """Return a clip's length from the start and end in its id."""
+        parts = bare_identifier(descriptor["media_content_id"]).split("|", 6)
+        if len(parts) != 7:
+            return None
+        start = _parse_reolink_time(parts[5])
+        end = _parse_reolink_time(parts[6])
+        if start is None or end is None or end <= start:
+            return None
+        return int((end - start).total_seconds())
 
     @staticmethod
     def _camera_marker(descriptor: dict[str, Any]) -> str:
@@ -1083,12 +1147,21 @@ class ReolinkClipCacheCoordinator:
         dest: Path,
         headers: dict[str, str] | None = None,
         label: str = "the Home Assistant proxy",
+        max_seconds: float | None = None,
     ) -> int:
-        """Stream a URL to disk. Returns the number of bytes written."""
+        """Stream a URL to disk. Returns the number of bytes written.
+
+        ``max_seconds`` is for live streams such as FLV playback, which need
+        not end when the recording does: reading stops at that point, and a
+        stream the NVR cuts off still keeps what arrived.
+        """
         session = async_get_clientsession(self.hass, verify_ssl=False)
         written = 0
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max_seconds if max_seconds else None
+        limit = max(DOWNLOAD_TIMEOUT, (max_seconds or 0) + 30)
         try:
-            async with asyncio.timeout(DOWNLOAD_TIMEOUT):
+            async with asyncio.timeout(limit):
                 async with session.get(
                     url, headers=headers or DOWNLOAD_HEADERS
                 ) as response:
@@ -1100,7 +1173,7 @@ class ReolinkClipCacheCoordinator:
                         except Exception:  # noqa: BLE001
                             detail = "<unreadable body>"
                         self._last_status = response.status
-                        self._last_error = (
+                        self._last_error = redact(
                             f"HTTP {response.status} ({response.content_type})"
                             f"{f' {detail}' if detail else ''}"
                         )
@@ -1112,44 +1185,55 @@ class ReolinkClipCacheCoordinator:
                         ):
                             await self.hass.async_add_executor_job(handle.write, chunk)
                             written += len(chunk)
+                            if deadline is not None and loop.time() >= deadline:
+                                break
                     finally:
                         await self.hass.async_add_executor_job(handle.close)
         except TimeoutError:
-            self._last_error = f"timed out after {DOWNLOAD_TIMEOUT}s"
+            self._last_error = f"timed out after {limit:.0f}s"
             return 0
         except ClientError as err:
+            if deadline is not None and written:
+                # A playback stream that the NVR closes early is still a clip.
+                return written
             # Naming the exception type matters: a dropped connection, a
             # refused one and a bad response all read alike without it.
-            self._last_error = f"{type(err).__name__}: {err}"
+            self._last_error = redact(f"{type(err).__name__}: {err}")
             return 0
         if not written:
             self._last_error = "empty response"
         return written
 
-    async def _async_faststart(self, src: Path, dest: Path) -> None:
+    async def _async_faststart(self, src: Path, dest: Path) -> bool:
         """Move the MP4 index to the front so playback can start immediately.
 
         Without this the browser has to fetch the whole file before the first
         frame, which is a large part of the delay this integration removes.
+        An FLV recording is remuxed into MP4 the same way; it is useless to a
+        browser as it is, so it fails (returns False) if that cannot be done.
         """
+        head = await self.hass.async_add_executor_job(_read_head, src, 3)
+        is_flv = head.startswith(FLV_MAGIC)
+
         if binary := self._ffmpeg_binary():
-            ok = await self._run_ffmpeg(
-                binary,
-                "-y",
-                "-i",
-                str(src),
-                "-c",
-                "copy",
-                "-movflags",
-                "+faststart",
-                str(dest),
-            )
+            base = ["-y", *(["-f", "flv"] if is_flv else []), "-i", str(src)]
+            tail = ["-movflags", "+faststart", "-f", "mp4", str(dest)]
+            ok = await self._run_ffmpeg(binary, *base, "-c", "copy", *tail)
+            if not ok and is_flv:
+                # Some cameras put audio in their FLV that MP4 will not take
+                # as is. The picture is what matters here.
+                ok = await self._run_ffmpeg(binary, *base, "-c:v", "copy", "-an", *tail)
             if ok:
                 await self.hass.async_add_executor_job(_unlink, src)
-                return
+                return True
             _LOGGER.debug("Faststart failed for %s, storing as downloaded", src.name)
 
+        if is_flv:
+            await self.hass.async_add_executor_job(_unlink, dest)
+            self._last_error = "ffmpeg could not turn the FLV recording into MP4"
+            return False
         await self.hass.async_add_executor_job(shutil.move, str(src), str(dest))
+        return True
 
     async def _async_thumbnail(self, src: Path, dest: Path) -> bool:
         """Grab a poster frame for the filmstrip."""
@@ -1468,15 +1552,13 @@ class ReolinkClipCacheCoordinator:
 
         Waits first: the browser is streaming this very clip from the NVR, and
         NVRs serve only a few playback sessions at once, so a parallel download
-        would slow the play the user is waiting on.
+        would slow the play the user is waiting on. Not for a camera that only
+        works over FLV: Home Assistant's player asks that NVR for Download,
+        which it refuses, so nothing is streaming and the cache is the only way
+        the clip will play.
         """
         parts = bare_identifier(media_content_id).split("|", 6)
         if len(parts) != 7 or parts[0] != "FILE":
-            return
-
-        await asyncio.sleep(ON_DEMAND_CACHE_DELAY)
-        record = self._index.get(clip_id_for(media_content_id))
-        if record and record.get("cached_at"):
             return
 
         camera = next(
@@ -1488,6 +1570,12 @@ class ReolinkClipCacheCoordinator:
             None,
         )
         if camera is None:
+            return
+
+        if self._vod_types.get(camera.key) != "FLV":
+            await asyncio.sleep(ON_DEMAND_CACHE_DELAY)
+        record = self._index.get(clip_id_for(media_content_id))
+        if record and record.get("cached_at"):
             return
 
         start = _parse_reolink_time(parts[5])
@@ -1625,7 +1713,9 @@ class ReolinkClipCacheCoordinator:
             for type_name in VOD_TYPE_LADDER:
                 url = await self._async_direct_source(descriptor, type_name)
                 routes[f"direct/{type_name}"] = (
-                    await self._async_probe(url, DIRECT_HEADERS)
+                    await self._async_probe(
+                        url, DIRECT_HEADERS, ranged=type_name != "FLV"
+                    )
                     if url
                     else "no URL for this request type"
                 )
@@ -1644,24 +1734,42 @@ class ReolinkClipCacheCoordinator:
 
         return report
 
-    async def _async_probe(self, url: str, headers: dict[str, str]) -> str:
-        """Ask for the first slice of a clip and describe what came back."""
+    async def _async_probe(
+        self, url: str, headers: dict[str, str], ranged: bool = True
+    ) -> str:
+        """Ask for the first slice of a clip and describe what came back.
+
+        A playback stream (FLV) is not a file, so it is asked for without a
+        byte range and simply read until enough has arrived.
+        """
         session = async_get_clientsession(self.hass, verify_ssl=False)
-        probe = {**headers, "Range": "bytes=0-65535"}
+        probe = {**headers, "Range": "bytes=0-65535"} if ranged else dict(headers)
         try:
             async with asyncio.timeout(30):
                 async with session.get(url, headers=probe) as response:
-                    body = await response.content.read(65536)
-                    if response.status in OK_STATUSES:
-                        return f"OK - HTTP {response.status}, {len(body)} bytes, {response.content_type}"
-                    detail = body[:200].decode("utf-8", "replace").strip()
-                    return f"HTTP {response.status} ({response.content_type}) {detail}"
+                    if response.status not in OK_STATUSES:
+                        body = await response.content.read(65536)
+                        detail = body[:200].decode("utf-8", "replace").strip()
+                        return redact(
+                            f"HTTP {response.status} ({response.content_type}) {detail}"
+                        )
+                    body = b""
+                    while len(body) < 65536:
+                        chunk = await response.content.read(65536 - len(body))
+                        if not chunk:
+                            break
+                        body += chunk
+                    kind = ", FLV data" if body.startswith(FLV_MAGIC) else ""
+                    if not body:
+                        return f"HTTP {response.status} but no data"
+                    return (
+                        f"OK - HTTP {response.status}, {len(body)} bytes, "
+                        f"{response.content_type}{kind}"
+                    )
         except TimeoutError:
             return "timed out after 30s"
-        except ClientError as err:
-            return f"{type(err).__name__}: {err}"
         except Exception as err:  # noqa: BLE001
-            return f"{type(err).__name__}: {err}"
+            return redact(f"{type(err).__name__}: {err}")
 
     def stats(self) -> dict[str, Any]:
         """Return cache statistics for the status command and the sensors."""
@@ -1709,6 +1817,15 @@ def _open_write(path: Path):
     """Open a file for binary writing (executor)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     return path.open("wb")
+
+
+def _read_head(path: Path, size: int) -> bytes:
+    """Return the first bytes of a file, or nothing if it is gone (executor)."""
+    try:
+        with path.open("rb") as handle:
+            return handle.read(size)
+    except OSError:
+        return b""
 
 
 def _unlink(path: Path) -> None:

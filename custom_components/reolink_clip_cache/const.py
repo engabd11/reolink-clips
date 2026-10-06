@@ -69,13 +69,22 @@ DOWNLOAD_RETRY_BACKOFF: Final = (5, 20)
 # Breathing room between clips so a sweep does not hammer the NVR.
 DOWNLOAD_SPACING: Final = 2
 
-# VOD request types to try against the NVR, best first. Home Assistant always
-# asks an NVR for Download, but many will not serve that and hang up; those
-# want the recording prepared through NvrDownload first.
 # How many days back the diagnose service looks for a clip to test.
 DIAGNOSE_DAYS: Final = 3
 
-VOD_TYPE_LADDER: Final = ("DOWNLOAD", "NVR_DOWNLOAD", "PLAYBACK")
+# VOD request types to try against the NVR, best first. Home Assistant always
+# asks an NVR for Download, but many will not serve that and hang up; those
+# want the recording prepared through NvrDownload first. Some (an RLN8-410 on
+# firmware 3.6.5 refuses both) still serve FLV, the playback stream the
+# Reolink web client uses: it is remuxed to MP4 once downloaded.
+VOD_TYPE_LADDER: Final = ("DOWNLOAD", "NVR_DOWNLOAD", "FLV", "PLAYBACK")
+
+# FLV is a playback stream rather than a file, so it may arrive at about real
+# time and may not end with the recording. Read for the clip's length plus this
+# much, then keep what arrived.
+FLV_GRACE_SECONDS: Final = 15
+# Used when a clip's length cannot be worked out from its id.
+FLV_FALLBACK_SECONDS: Final = 120
 
 # Abandon a sweep once this many clips fail back to back.
 CONSECUTIVE_FAILURE_LIMIT: Final = 3
