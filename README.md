@@ -185,8 +185,9 @@ logger:
   backoff, and picked up again on later sweeps. The log names which route failed. NVRs
   differ in which VOD request types they will serve, and a refusal arrives as a dropped
   connection rather than a useful error, so the integration tries the Reolink library's
-  own download, then `Download`, `NvrDownload`, `FLV` and `Playback` in turn, and sticks
-  with whichever works. **Run `reolink_clip_cache.diagnose`** to see exactly what each
+  own download, then `Download`, `NvrDownload`, `FLV` and `Playback` in turn (the first
+  three also over the NVR's plain HTTP port when Home Assistant talks to it over HTTPS),
+  and sticks with whichever works. **Run `reolink_clip_cache.diagnose`** to see exactly what each
   route does for one real recording. Switching the stream option to the other
   resolution is also worth a try.
 - **Only the `FLV` route works** — some NVRs (an RLN8-410 on firmware 3.6.5, for one)

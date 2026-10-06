@@ -74,10 +74,29 @@ DIAGNOSE_DAYS: Final = 3
 
 # VOD request types to try against the NVR, best first. Home Assistant always
 # asks an NVR for Download, but many will not serve that and hang up; those
-# want the recording prepared through NvrDownload first. Some (an RLN8-410 on
-# firmware 3.6.5 refuses both) still serve FLV, the playback stream the
-# Reolink web client uses: it is remuxed to MP4 once downloaded.
+# want the recording prepared through NvrDownload first. Others still serve
+# FLV, the playback stream the Reolink web client uses: it is remuxed to MP4
+# once downloaded.
 VOD_TYPE_LADDER: Final = ("DOWNLOAD", "NVR_DOWNLOAD", "FLV", "PLAYBACK")
+
+# These are also tried over the NVR's plain HTTP port when the Reolink
+# integration talks to it over HTTPS. An RLN8-410 on firmware 3.6.5 answers API
+# calls over HTTPS but hangs up on every media request there, Home Assistant's
+# own player included, while its HTTP port streams FLV fine.
+PLAIN_HTTP_TYPES: Final = ("DOWNLOAD", "NVR_DOWNLOAD", "FLV")
+PLAIN_HTTP_SUFFIX: Final = "/HTTP"
+
+# Every direct route, in the order tried: each request type over the
+# integration's own connection, then over plain HTTP.
+DIRECT_ROUTES: Final = tuple(
+    route
+    for request_type in VOD_TYPE_LADDER
+    for route in (
+        (request_type, f"{request_type}{PLAIN_HTTP_SUFFIX}")
+        if request_type in PLAIN_HTTP_TYPES
+        else (request_type,)
+    )
+)
 
 # FLV is a playback stream rather than a file, so it may arrive at about real
 # time and may not end with the recording. Read for the clip's length plus this

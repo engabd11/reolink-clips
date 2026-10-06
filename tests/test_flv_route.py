@@ -99,6 +99,25 @@ async def main() -> None:
           all(x not in cleaned for x in ("admin", "hunter2", "abc123")) and "password=***" in cleaned, cleaned)
     check("a clip's length comes from its id", mod.ReolinkClipCacheCoordinator._clip_seconds(descriptor) == 30)
 
+    # Plain HTTP variants for an NVR that hangs up on media over HTTPS.
+    order = make(tmp)._route_order(descriptor)
+    check("each route over HTTPS is followed by the same over HTTP",
+          all(order.index(f"{t}/HTTP") == order.index(t) + 1 for t in const.PLAIN_HTTP_TYPES), str(order))
+    check("PLAYBACK has no HTTP variant and the proxy is last",
+          "PLAYBACK/HTTP" not in order and order[-1] == "PROXY", str(order))
+    check("routes split into request type and transport",
+          mod.split_route("FLV/HTTP") == ("FLV", True) and mod.split_route("FLV") == ("FLV", False))
+    flv = "https://192.168.0.118:443/flv?port=1935&app=bcs&stream=playback.bcs&channel=2&type=1&start=Mp4Record/x.mp4&seek=0&user=u&password=p"
+    plain = mod.plain_http_url(flv, {"NetPort": {"httpPort": 80, "httpEnable": 1, "httpsPort": 443}})
+    check("an HTTPS URL moves to the HTTP port, query untouched",
+          plain == flv.replace("https://192.168.0.118:443/", "http://192.168.0.118/"), str(plain))
+    check("a custom HTTP port is kept",
+          mod.plain_http_url(flv, {"NetPort": {"httpPort": 8080}}) == flv.replace("https://192.168.0.118:443/", "http://192.168.0.118:8080/"))
+    check("no port settings means port 80", mod.plain_http_url(flv, None).startswith("http://192.168.0.118/"))
+    check("an HTTP port that is turned off gives no URL", mod.plain_http_url(flv, {"NetPort": {"httpEnable": 0}}) is None)
+    check("an HTTP URL needs no variant", mod.plain_http_url("http://nvr/flv?x=1", None) is None)
+    check("the label says over HTTP", "FLV over HTTP" in mod.ReolinkClipCacheCoordinator._route_label("FLV/HTTP"))
+
     # The FLV route asks for the clip's length plus the grace period.
     coord = make(tmp)
     asked: dict = {}

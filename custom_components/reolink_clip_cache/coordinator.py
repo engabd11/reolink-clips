@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from datetime import date as dt_date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from aiohttp import ClientError
 
@@ -62,6 +63,7 @@ from .const import (
     DEFAULT_STREAM,
     DEFAULT_SWEEP_MINUTES,
     DIAGNOSE_DAYS,
+    DIRECT_ROUTES,
     DIRECT_HEADERS,
     DOWNLOAD_ATTEMPTS,
     DOWNLOAD_CHUNK_SIZE,
@@ -77,6 +79,7 @@ from .const import (
     MAX_CLIPS_PER_SWEEP,
     MAX_CONCURRENT_DOWNLOADS,
     OK_STATUSES,
+    PLAIN_HTTP_SUFFIX,
     REOLINK_DOMAIN,
     REOLINK_MEDIA_PREFIX,
     SIGNAL_INDEX_UPDATED,
@@ -90,7 +93,6 @@ from .const import (
     THUMBS_DIR_NAME,
     THUMB_URL,
     TRIGGER_ALIASES,
-    VOD_TYPE_LADDER,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -101,6 +103,34 @@ SAVE_DELAY = 10
 _SECRET_PARAMS = re.compile(r"((?:password|token|user)=)[^&\s'\"]*", re.IGNORECASE)
 
 FLV_MAGIC = b"FLV"
+
+
+def split_route(route: str) -> tuple[str, bool]:
+    """Split a direct route into its VOD request type and whether it is plain HTTP."""
+    if route.endswith(PLAIN_HTTP_SUFFIX):
+        return route[: -len(PLAIN_HTTP_SUFFIX)], True
+    return route, False
+
+
+def plain_http_url(url: str, netport: dict[str, Any] | None) -> str | None:
+    """Return an HTTPS NVR URL rewritten for the NVR's plain HTTP port.
+
+    None when the URL is not HTTPS (nothing to change) or the NVR has its HTTP
+    port turned off.
+    """
+    parts = urlsplit(url)
+    if parts.scheme != "https" or not parts.hostname:
+        return None
+    ports = (netport or {}).get("NetPort") or {}
+    if ports.get("httpEnable", 1) != 1:
+        return None
+    try:
+        port = int(ports.get("httpPort") or 80)
+    except (TypeError, ValueError):
+        port = 80
+    host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+    netloc = host if port == 80 else f"{host}:{port}"
+    return urlunsplit(("http", netloc, parts.path, parts.query, parts.fragment))
 
 
 def redact(text: str) -> str:
@@ -887,7 +917,7 @@ class ReolinkClipCacheCoordinator:
         then Home Assistant's playback proxy. The route that last worked for a
         camera goes first.
         """
-        routes = ["LIBRARY", *VOD_TYPE_LADDER, "PROXY"]
+        routes = ["LIBRARY", *DIRECT_ROUTES, "PROXY"]
         if (known := self._vod_types.get(self._camera_marker(descriptor))) in routes:
             routes.remove(known)
             routes.insert(0, known)
@@ -900,7 +930,8 @@ class ReolinkClipCacheCoordinator:
             return "the Reolink library"
         if route == "PROXY":
             return "the Home Assistant proxy"
-        return f"the NVR directly ({route})"
+        request_type, plain_http = split_route(route)
+        return f"the NVR directly ({request_type}{' over HTTP' if plain_http else ''})"
 
     def _host_api(self, descriptor: dict[str, Any]) -> Any | None:
         """Return the Reolink integration's API object for a clip, if loaded."""
@@ -985,11 +1016,12 @@ class ReolinkClipCacheCoordinator:
                 return 0
             return await self._async_download(source, dest, label=self._route_label(route))
 
-        url = await self._async_direct_source(descriptor, route)
+        request_type, plain_http = split_route(route)
+        url = await self._async_direct_source(descriptor, request_type, plain_http)
         if url is None:
             self._last_error = "not offered for this recording"
             return 0
-        if route == "FLV":
+        if request_type == "FLV":
             return await self._async_flv_download(url, descriptor, dest)
         written = await self._async_download(
             url, dest, headers=DIRECT_HEADERS, label=self._route_label(route)
@@ -1002,7 +1034,9 @@ class ReolinkClipCacheCoordinator:
                     await api.expire_session(unsubscribe=False)
                 except Exception:  # noqa: BLE001
                     pass
-                if url := await self._async_direct_source(descriptor, route):
+                if url := await self._async_direct_source(
+                    descriptor, request_type, plain_http
+                ):
                     await self.hass.async_add_executor_job(_unlink, dest)
                     written = await self._async_download(
                         url, dest, headers=DIRECT_HEADERS, label=self._route_label(route)
@@ -1055,7 +1089,10 @@ class ReolinkClipCacheCoordinator:
         return f"{descriptor.get('camera')}"
 
     async def _async_direct_source(
-        self, descriptor: dict[str, Any], request_type_name: str = "DOWNLOAD"
+        self,
+        descriptor: dict[str, Any],
+        request_type_name: str = "DOWNLOAD",
+        plain_http: bool = False,
     ) -> str | None:
         """Ask the Reolink integration for the NVR's own URL for a clip.
 
@@ -1094,7 +1131,11 @@ class ReolinkClipCacheCoordinator:
             )
             return None
 
-        return url if url.startswith(("http://", "https://")) else None
+        if not url.startswith(("http://", "https://")):
+            return None
+        if plain_http:
+            return plain_http_url(url, getattr(api, "_netport_settings", None))
+        return url
 
     async def _async_download_with_retries(
         self, descriptor: dict[str, Any], dest: Path
@@ -1710,11 +1751,14 @@ class ReolinkClipCacheCoordinator:
             routes["library/download_vod"] = (
                 f"OK - {written} bytes" if written else self._last_error or "failed"
             )
-            for type_name in VOD_TYPE_LADDER:
-                url = await self._async_direct_source(descriptor, type_name)
-                routes[f"direct/{type_name}"] = (
+            for route in DIRECT_ROUTES:
+                request_type, plain_http = split_route(route)
+                url = await self._async_direct_source(
+                    descriptor, request_type, plain_http
+                )
+                routes[f"direct/{route}"] = (
                     await self._async_probe(
-                        url, DIRECT_HEADERS, ranged=type_name != "FLV"
+                        url, DIRECT_HEADERS, ranged=request_type != "FLV"
                     )
                     if url
                     else "no URL for this request type"
