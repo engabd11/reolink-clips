@@ -8,7 +8,7 @@ from typing import Final
 from homeassistant.const import Platform
 
 DOMAIN: Final = "reolink_clip_cache"
-VERSION: Final = "2.3.2"
+VERSION: Final = "2.3.3"
 
 PLATFORMS: Final = [Platform.BUTTON, Platform.SENSOR]
 
@@ -144,6 +144,9 @@ CLIP_FAILURE_LIMIT: Final = 3
 # Delay after a detection sensor clears before sweeping for the new clip. The
 # NVR only finalises the recording once the event has ended.
 EVENT_SETTLE_DELAY: Final = 20
+# After a detection, at most this many of the camera's newest uncached clips
+# are fetched ahead of any running sweep.
+EVENT_FETCH_LIMIT: Final = 3
 
 # Never sweep the same camera more often than this, however many events fire.
 SWEEP_COOLDOWN: Final = timedelta(seconds=15)

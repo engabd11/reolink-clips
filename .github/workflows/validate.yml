@@ -51,6 +51,8 @@ jobs:
         run: python tests/test_native_route.py
       - name: Check the buttons
         run: python tests/test_buttons.py
+      - name: Check new events go ahead of a sweep
+        run: python tests/test_event_priority.py
 
   syntax:
     name: Syntax

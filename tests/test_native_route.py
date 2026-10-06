@@ -73,6 +73,9 @@ def make(tmp: pathlib.Path, api: FakeApi) -> mod.ReolinkClipCacheCoordinator:
     coord.hass = types.SimpleNamespace(async_add_executor_job=run_in_executor)
     coord._vod_types = {}
     coord._cameras = {}
+    coord._priority_jobs = 0
+    coord._priority_idle = asyncio.Event()
+    coord._priority_idle.set()
     coord._native_files = {}
     coord._segments = {}
     coord._segments_dir = tmp / "segments"
