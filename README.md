@@ -184,10 +184,19 @@ logger:
   NVR directly when possible and via Home Assistant's proxy otherwise, retried with a
   backoff, and picked up again on later sweeps. The log names which route failed. NVRs
   differ in which VOD request types they will serve, and a refusal arrives as a dropped
-  connection rather than a useful error, so the integration tries `Download`,
-  `NvrDownload` and `Playback` in turn and sticks with whichever works. **Run
-  `reolink_clip_cache.diagnose`** to see exactly what each route does for one real
-  recording. Switching the stream option to the other resolution is also worth a try.
+  connection rather than a useful error, so the integration tries the Reolink library's
+  own download, then `Download`, `NvrDownload`, `FLV` and `Playback` in turn (the first
+  three also over the NVR's plain HTTP port when Home Assistant talks to it over HTTPS),
+  and sticks with whichever works. **Run `reolink_clip_cache.diagnose`** to see exactly what each
+  route does for one real recording. Switching the stream option to the other
+  resolution is also worth a try.
+- **Only the `FLV` route works** — some NVRs (an RLN8-410 on firmware 3.6.5, for one)
+  refuse every MP4 download, Home Assistant's own media browser included, but still
+  serve the FLV playback stream their web client uses. Clips are then recorded from that
+  stream, at about real time, and remuxed to MP4 with ffmpeg, so a 30 second clip takes
+  about 30 seconds to cache. Home Assistant cannot play these clips from the NVR either,
+  so pressing Play on an uncached clip caches it straight away, and the card picks it up
+  when it is ready.
 
 ## Credits
 

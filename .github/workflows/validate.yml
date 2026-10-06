@@ -45,6 +45,10 @@ jobs:
         run: python tests/test_config_flow_event_types.py
       - name: Check download routes and back off
         run: python tests/test_download_routes.py
+      - name: Check the FLV route
+        run: python tests/test_flv_route.py
+      - name: Check the native file name routes
+        run: python tests/test_native_route.py
 
   syntax:
     name: Syntax

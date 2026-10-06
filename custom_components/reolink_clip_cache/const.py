@@ -8,7 +8,7 @@ from typing import Final
 from homeassistant.const import Platform
 
 DOMAIN: Final = "reolink_clip_cache"
-VERSION: Final = "2.2.1"
+VERSION: Final = "2.3.0"
 
 PLATFORMS: Final = [Platform.SENSOR]
 
@@ -69,13 +69,63 @@ DOWNLOAD_RETRY_BACKOFF: Final = (5, 20)
 # Breathing room between clips so a sweep does not hammer the NVR.
 DOWNLOAD_SPACING: Final = 2
 
-# VOD request types to try against the NVR, best first. Home Assistant always
-# asks an NVR for Download, but many will not serve that and hang up; those
-# want the recording prepared through NvrDownload first.
 # How many days back the diagnose service looks for a clip to test.
 DIAGNOSE_DAYS: Final = 3
 
-VOD_TYPE_LADDER: Final = ("DOWNLOAD", "NVR_DOWNLOAD", "PLAYBACK")
+# VOD request types to try against the NVR, best first. Home Assistant always
+# asks an NVR for Download, but many will not serve that and hang up; those
+# want the recording prepared through NvrDownload first. Others still serve
+# FLV, the playback stream the Reolink web client uses: it is remuxed to MP4
+# once downloaded.
+VOD_TYPE_LADDER: Final = ("DOWNLOAD", "NVR_DOWNLOAD", "FLV", "PLAYBACK")
+
+# These are also tried over the NVR's plain HTTP port when the Reolink
+# integration talks to it over HTTPS. An RLN8-410 on firmware 3.6.5 answers API
+# calls over HTTPS but hangs up on every media request there, Home Assistant's
+# own player included, while its HTTP port streams FLV fine.
+PLAIN_HTTP_TYPES: Final = ("DOWNLOAD", "NVR_DOWNLOAD", "FLV")
+PLAIN_HTTP_SUFFIX: Final = "/HTTP"
+
+# Every direct route, in the order tried: each request type over the
+# integration's own connection, then over plain HTTP.
+DIRECT_ROUTES: Final = tuple(
+    route
+    for request_type in VOD_TYPE_LADDER
+    for route in (
+        (request_type, f"{request_type}{PLAIN_HTTP_SUFFIX}")
+        if request_type in PLAIN_HTTP_TYPES
+        else (request_type,)
+    )
+)
+
+# FLV is a playback stream rather than a file, so it may arrive at about real
+# time and may not end with the recording. Read for the clip's length plus this
+# much, then keep what arrived.
+FLV_GRACE_SECONDS: Final = 15
+# Used when a clip's length cannot be worked out from its id.
+FLV_FALLBACK_SECONDS: Final = 120
+
+# Routes that ask the NVR for a recording by its native file name, as its
+# Search command reports it (for example 1-0-0-01260906130000-00000), rather
+# than by time. An RLN8-410 on firmware 3.6.5 hangs up on every other request
+# for a recording, Home Assistant's own player included: NvrDownload hands back
+# a temporary fragment_*.mp4 name that its Download then refuses
+# (home-assistant/core#179099). Native names are hour-long segments, so
+# NATIVE_FLV streams from the clip's offset into the segment, and
+# NATIVE_DOWNLOAD fetches the segment once and cuts every clip it holds out
+# of it.
+NATIVE_FLV: Final = "NATIVE_FLV"
+NATIVE_DOWNLOAD: Final = "NATIVE_DOWNLOAD"
+NATIVE_ROUTES: Final = (NATIVE_FLV, NATIVE_DOWNLOAD)
+# Fetching a whole segment takes longer than one clip.
+NATIVE_DOWNLOAD_TIMEOUT: Final = 600
+# Segments are kept briefly for the other clips they hold, then deleted.
+SEGMENTS_DIR_NAME: Final = "segments"
+SEGMENTS_KEPT: Final = 2
+SEGMENT_KEEP_MINUTES: Final = 30
+# A segment still being recorded is only reused if fetched this long after
+# the clip ended.
+SEGMENT_SETTLE_SECONDS: Final = 15
 
 # Abandon a sweep once this many clips fail back to back.
 CONSECUTIVE_FAILURE_LIMIT: Final = 3

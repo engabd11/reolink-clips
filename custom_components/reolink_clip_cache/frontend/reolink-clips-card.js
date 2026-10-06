@@ -16,7 +16,7 @@
  *   autoplay: false
  */
 
-const CARD_VERSION = '2.2.1';
+const CARD_VERSION = '2.3.0';
 
 // Signed clip and thumbnail URLs live for 30 minutes; refresh the list before then
 // so a wall tablet left on this card keeps working.

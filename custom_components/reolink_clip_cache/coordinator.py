@@ -15,11 +15,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 import shutil
 from dataclasses import dataclass, field
 from datetime import date as dt_date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from aiohttp import ClientError
 
@@ -61,6 +63,7 @@ from .const import (
     DEFAULT_STREAM,
     DEFAULT_SWEEP_MINUTES,
     DIAGNOSE_DAYS,
+    DIRECT_ROUTES,
     DIRECT_HEADERS,
     DOWNLOAD_ATTEMPTS,
     DOWNLOAD_CHUNK_SIZE,
@@ -71,9 +74,20 @@ from .const import (
     EVENT_CLIP_CACHED,
     EVENT_SETTLE_DELAY,
     FFMPEG_TIMEOUT,
+    FLV_FALLBACK_SECONDS,
+    FLV_GRACE_SECONDS,
+    NATIVE_DOWNLOAD,
+    NATIVE_DOWNLOAD_TIMEOUT,
+    NATIVE_FLV,
+    NATIVE_ROUTES,
+    SEGMENT_KEEP_MINUTES,
+    SEGMENT_SETTLE_SECONDS,
+    SEGMENTS_DIR_NAME,
+    SEGMENTS_KEPT,
     MAX_CLIPS_PER_SWEEP,
     MAX_CONCURRENT_DOWNLOADS,
     OK_STATUSES,
+    PLAIN_HTTP_SUFFIX,
     REOLINK_DOMAIN,
     REOLINK_MEDIA_PREFIX,
     SIGNAL_INDEX_UPDATED,
@@ -87,12 +101,91 @@ from .const import (
     THUMBS_DIR_NAME,
     THUMB_URL,
     TRIGGER_ALIASES,
-    VOD_TYPE_LADDER,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
 SAVE_DELAY = 10
+
+# The FLV route puts the NVR login in the URL, and a token rides on the others.
+_SECRET_PARAMS = re.compile(r"((?:password|token|user)=)[^&\s'\"]*", re.IGNORECASE)
+
+FLV_MAGIC = b"FLV"
+
+
+def split_route(route: str) -> tuple[str, bool]:
+    """Split a direct route into its VOD request type and whether it is plain HTTP."""
+    if route.endswith(PLAIN_HTTP_SUFFIX):
+        return route[: -len(PLAIN_HTTP_SUFFIX)], True
+    return route, False
+
+
+def plain_http_url(url: str, netport: dict[str, Any] | None) -> str | None:
+    """Return an HTTPS NVR URL rewritten for the NVR's plain HTTP port.
+
+    None when the URL is not HTTPS (nothing to change) or the NVR has its HTTP
+    port turned off.
+    """
+    parts = urlsplit(url)
+    if parts.scheme != "https" or not parts.hostname:
+        return None
+    ports = (netport or {}).get("NetPort") or {}
+    if ports.get("httpEnable", 1) != 1:
+        return None
+    try:
+        port = int(ports.get("httpPort") or 80)
+    except (TypeError, ValueError):
+        port = 80
+    host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+    netloc = host if port == 80 else f"{host}:{port}"
+    return urlunsplit(("http", netloc, parts.path, parts.query, parts.fragment))
+
+
+def with_seek(url: str, seconds: int) -> str:
+    """Set the seek (seconds into the recording) of an NVR FLV playback URL."""
+    if re.search(r"[?&]seek=", url):
+        return re.sub(r"([?&]seek=)[^&]*", lambda m: f"{m.group(1)}{int(seconds)}", url, count=1)
+    return f"{url}{'&' if '?' in url else '?'}seek={int(seconds)}"
+
+
+def pick_native_file(files: list[dict[str, Any]], start_id: str) -> dict[str, Any] | None:
+    """Pick the named recording segment that holds a clip starting at start_id.
+
+    ``files`` are the raw entries of the NVR's Search reply. Returns the
+    segment's name, its start id and the clip's offset into it in seconds.
+    """
+    clip_start = _parse_reolink_time(start_id)
+    if clip_start is None:
+        return None
+    best: dict[str, Any] | None = None
+    for data in files:
+        name = data.get("name")
+        try:
+            seg_start = _parse_reolink_time(_time_id(data["StartTime"]))
+            seg_end = _parse_reolink_time(_time_id(data["EndTime"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not name or seg_start is None or seg_end is None:
+            continue
+        if seg_start <= clip_start < seg_end:
+            offset = int((clip_start - seg_start).total_seconds())
+            # Prefer the segment that starts closest before the clip.
+            if best is None or offset < best["offset"]:
+                best = {"name": name, "start": _time_id(data["StartTime"]), "offset": offset}
+    return best
+
+
+def _time_id(value: dict[str, Any]) -> str:
+    """Turn a Reolink time dict into a YYYYMMDDHHMMSS id."""
+    return (
+        f"{int(value['year']):04d}{int(value['mon']):02d}{int(value['day']):02d}"
+        f"{int(value['hour']):02d}{int(value['min']):02d}{int(value['sec']):02d}"
+    )
+
+
+def redact(text: str) -> str:
+    """Hide credentials that an error message may echo back from a URL."""
+    return _SECRET_PARAMS.sub(r"\1***", text)
 
 
 @dataclass(slots=True)
@@ -199,6 +292,9 @@ class ReolinkClipCacheCoordinator:
         self._root = Path(hass.config.path(STORAGE_DIR_NAME))
         self._clips_dir = self._root / CLIPS_DIR_NAME
         self._thumbs_dir = self._root / THUMBS_DIR_NAME
+        self._segments_dir = self._root / SEGMENTS_DIR_NAME
+        # Recording segments fetched for NATIVE_DOWNLOAD, by segment key.
+        self._segments: dict[str, dict[str, Any]] = {}
 
         # clip_id -> clip record (a descriptor plus cache state)
         self._index: dict[str, dict[str, Any]] = {}
@@ -221,6 +317,8 @@ class ReolinkClipCacheCoordinator:
         self._backoff: dict[str, tuple[datetime, int]] = {}
         # clip id -> sweeps that failed to download it
         self._clip_failures: dict[str, int] = {}
+        # (entry, channel, stream, start id) -> the clip's native segment.
+        self._native_files: dict[tuple[str, ...], dict[str, Any]] = {}
         # why the last download attempt failed, for one summary warning per clip
         self._last_error = ""
         self._last_status: int | None = None
@@ -282,9 +380,11 @@ class ReolinkClipCacheCoordinator:
         self._unsubs.append(async_at_started(self.hass, self._async_started))
 
     def _make_dirs(self) -> None:
-        """Create the cache directories (executor)."""
+        """Create the cache directories and drop stale segments (executor)."""
         self._clips_dir.mkdir(parents=True, exist_ok=True)
         self._thumbs_dir.mkdir(parents=True, exist_ok=True)
+        if self._segments_dir.exists():
+            shutil.rmtree(self._segments_dir, ignore_errors=True)
 
     async def _async_started(self, _hass: HomeAssistant) -> None:
         """Discover cameras and start the sweep loop."""
@@ -326,6 +426,9 @@ class ReolinkClipCacheCoordinator:
             cancel()
         self._pending_sweeps.clear()
         await self._store.async_save({"clips": self._index})
+        await self.hass.async_add_executor_job(
+            shutil.rmtree, self._segments_dir, True
+        )
 
     # ── Discovery ──────────────────────────────────────────────────────
 
@@ -788,7 +891,16 @@ class ReolinkClipCacheCoordinator:
                     return False
                 self._clip_failures.pop(clip_id, None)
 
-                await self._async_faststart(part_path, clip_path)
+                if not await self._async_faststart(part_path, clip_path):
+                    _LOGGER.warning(
+                        "Could not store the %s clip from %s: %s",
+                        descriptor.get("camera_name") or descriptor["camera"],
+                        descriptor.get("start") or "",
+                        self._last_error,
+                    )
+                    await self.hass.async_add_executor_job(_unlink, part_path)
+                    self._clip_failures[clip_id] = self._clip_failures.get(clip_id, 0) + 1
+                    return False
                 thumb_ok = await self._async_thumbnail(
                     clip_path, self.thumb_path(clip_id)
                 )
@@ -865,7 +977,9 @@ class ReolinkClipCacheCoordinator:
         then Home Assistant's playback proxy. The route that last worked for a
         camera goes first.
         """
-        routes = ["LIBRARY", *VOD_TYPE_LADDER, "PROXY"]
+        nvr_download = [r for r in DIRECT_ROUTES if split_route(r)[0] == "NVR_DOWNLOAD"]
+        others = [r for r in DIRECT_ROUTES if r not in nvr_download]
+        routes = ["LIBRARY", NATIVE_FLV, *nvr_download, NATIVE_DOWNLOAD, *others, "PROXY"]
         if (known := self._vod_types.get(self._camera_marker(descriptor))) in routes:
             routes.remove(known)
             routes.insert(0, known)
@@ -878,7 +992,12 @@ class ReolinkClipCacheCoordinator:
             return "the Reolink library"
         if route == "PROXY":
             return "the Home Assistant proxy"
-        return f"the NVR directly ({route})"
+        if route == NATIVE_FLV:
+            return "the NVR directly (FLV by native file name)"
+        if route == NATIVE_DOWNLOAD:
+            return "the NVR directly (Download by native file name)"
+        request_type, plain_http = split_route(route)
+        return f"the NVR directly ({request_type}{' over HTTP' if plain_http else ''})"
 
     def _host_api(self, descriptor: dict[str, Any]) -> Any | None:
         """Return the Reolink integration's API object for a clip, if loaded."""
@@ -963,10 +1082,25 @@ class ReolinkClipCacheCoordinator:
                 return 0
             return await self._async_download(source, dest, label=self._route_label(route))
 
-        url = await self._async_direct_source(descriptor, route)
+        native: dict[str, Any] | None = None
+        if route in NATIVE_ROUTES:
+            native = await self._async_native_file(descriptor)
+            if native is None:
+                return 0
+            if route == NATIVE_DOWNLOAD:
+                return await self._async_segment_clip(descriptor, native, dest)
+            request_type, plain_http = "FLV", False
+        else:
+            request_type, plain_http = split_route(route)
+        name = native["name"] if native else None
+        url = await self._async_direct_source(descriptor, request_type, plain_http, name)
         if url is None:
             self._last_error = "not offered for this recording"
             return 0
+        if request_type == "FLV":
+            if native:
+                url = with_seek(url, native["offset"])
+            return await self._async_flv_download(url, descriptor, dest)
         written = await self._async_download(
             url, dest, headers=DIRECT_HEADERS, label=self._route_label(route)
         )
@@ -978,12 +1112,194 @@ class ReolinkClipCacheCoordinator:
                     await api.expire_session(unsubscribe=False)
                 except Exception:  # noqa: BLE001
                     pass
-                if url := await self._async_direct_source(descriptor, route):
+                if url := await self._async_direct_source(
+                    descriptor, request_type, plain_http, name
+                ):
                     await self.hass.async_add_executor_job(_unlink, dest)
                     written = await self._async_download(
                         url, dest, headers=DIRECT_HEADERS, label=self._route_label(route)
                     )
         return written
+
+    async def _async_segment_clip(
+        self, descriptor: dict[str, Any], native: dict[str, Any], dest: Path
+    ) -> int:
+        """Cut a clip out of its native recording segment, fetched once.
+
+        Returns the clip's size in bytes; sets _last_error on failure.
+        """
+        if not (binary := self._ffmpeg_binary()):
+            self._last_error = "ffmpeg is needed to cut a clip out of the NVR's recording"
+            return 0
+        segment = await self._async_segment(descriptor, native)
+        if segment is None:
+            return 0
+        seconds = self._clip_seconds(descriptor)
+        ok = await self._run_ffmpeg(
+            binary,
+            "-y",
+            "-ss",
+            str(native["offset"]),
+            "-i",
+            str(segment),
+            *(["-t", str(seconds)] if seconds else []),
+            "-c",
+            "copy",
+            "-f",
+            "mp4",
+            str(dest),
+        )
+        size = await self.hass.async_add_executor_job(_size_of, dest) if ok else 0
+        if not size:
+            await self.hass.async_add_executor_job(_unlink, dest)
+            self._last_error = "ffmpeg could not cut the clip out of the recording"
+        return size
+
+    async def _async_segment(
+        self, descriptor: dict[str, Any], native: dict[str, Any]
+    ) -> Path | None:
+        """Return the local copy of a clip's native segment, fetching it if needed.
+
+        A copy is reused for the segment's other clips, unless it was fetched
+        before this clip ended (the hour may still have been recording).
+        """
+        parts = bare_identifier(descriptor["media_content_id"]).split("|", 6)
+        entry_id, channel, stream, end_id = parts[1], parts[2], parts[3], parts[6]
+        key = f"{entry_id}|{channel}|{stream}|{native['name']}"
+        clip_end = _parse_reolink_time(end_id)
+        held = self._segments.get(key)
+        if (
+            held
+            and clip_end is not None
+            and held["fetched"] >= clip_end + timedelta(seconds=SEGMENT_SETTLE_SECONDS)
+            and await self.hass.async_add_executor_job(_size_of, held["path"])
+        ):
+            return held["path"]
+
+        await self._async_prune_segments()
+        path = self._segments_dir / f"{hashlib.sha1(key.encode()).hexdigest()[:16]}.mp4"
+        part = path.with_suffix(".part")
+        label = self._route_label(NATIVE_DOWNLOAD)
+        fetched = dt_util.now()
+        written = 0
+        for attempt in range(2):
+            url = await self._async_direct_source(descriptor, "DOWNLOAD", False, native["name"])
+            if url is None:
+                self._last_error = "not offered for this recording"
+                return None
+            self._last_status = None
+            written = await self._async_download(
+                url, part, headers=DIRECT_HEADERS, label=label, timeout=NATIVE_DOWNLOAD_TIMEOUT
+            )
+            if written or self._last_status != 401 or attempt:
+                break
+            # A stale login token: renew it and ask once more.
+            if (api := self._host_api(descriptor)) is not None:
+                try:
+                    await api.expire_session(unsubscribe=False)
+                except Exception:  # noqa: BLE001
+                    pass
+        if not written:
+            await self.hass.async_add_executor_job(_unlink, part)
+            return None
+        await self.hass.async_add_executor_job(part.replace, path)
+        self._segments[key] = {"path": path, "fetched": fetched}
+        _LOGGER.debug("Fetched recording segment %s (%d MiB)", native["name"], written >> 20)
+        return path
+
+    async def _async_prune_segments(self) -> None:
+        """Delete old segments, and all but the newest few."""
+        cutoff = dt_util.now() - timedelta(minutes=SEGMENT_KEEP_MINUTES)
+        newest = sorted(self._segments, key=lambda k: self._segments[k]["fetched"], reverse=True)
+        for index, key in enumerate(newest):
+            held = self._segments[key]
+            if index >= SEGMENTS_KEPT - 1 or held["fetched"] < cutoff:
+                await self.hass.async_add_executor_job(_unlink, held["path"])
+                del self._segments[key]
+
+    async def _async_native_file(
+        self, descriptor: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Find the NVR's native recording segment that holds a clip.
+
+        Returns the segment's name and the clip's offset into it in seconds,
+        or None (with _last_error set) when the NVR's Search does not name one.
+        """
+        parts = bare_identifier(descriptor["media_content_id"]).split("|", 6)
+        if len(parts) != 7 or parts[0] != "FILE":
+            self._last_error = "not a Reolink recording id"
+            return None
+        _, entry_id, channel, stream, _filename, start_id, end_id = parts
+        key = (entry_id, channel, stream, start_id)
+        if key in self._native_files:
+            return self._native_files[key]
+
+        api = self._host_api(descriptor)
+        start, end = _parse_reolink_time(start_id), _parse_reolink_time(end_id)
+        if api is None or start is None or end is None:
+            self._last_error = "the Reolink integration is not loaded"
+            return None
+        try:
+            _statuses, files = await api.request_vod_files(
+                int(channel), start, end, stream=stream
+            )
+        except Exception as err:  # noqa: BLE001 - any library error means no native name
+            self._last_error = redact(f"Search failed: {type(err).__name__}: {err}")
+            return None
+
+        native = pick_native_file(
+            [getattr(file, "data", {}) for file in files], start_id
+        )
+        if native is None:
+            self._last_error = (
+                f"the NVR's Search listed {len(files)} file(s) and none with a "
+                f"name covering {start_id}"
+            )
+            return None
+        if len(self._native_files) > 256:
+            self._native_files.clear()
+        self._native_files[key] = native
+        return native
+
+    async def _async_flv_download(
+        self, url: str, descriptor: dict[str, Any], dest: Path
+    ) -> int:
+        """Record a clip from the NVR's FLV playback stream.
+
+        The stream is read for the clip's length plus a grace period and kept
+        only if it really is FLV; _async_faststart then remuxes it to MP4.
+        """
+        seconds = self._clip_seconds(descriptor)
+        listen = (seconds or FLV_FALLBACK_SECONDS) + FLV_GRACE_SECONDS
+        written = await self._async_download(
+            url,
+            dest,
+            headers=DIRECT_HEADERS,
+            label=self._route_label("FLV"),
+            max_seconds=listen,
+        )
+        if not written:
+            return 0
+        head = await self.hass.async_add_executor_job(_read_head, dest, 64)
+        if not head.startswith(FLV_MAGIC):
+            self._last_error = (
+                "the NVR answered with something other than FLV: "
+                f"{redact(head.decode('utf-8', 'replace')).strip()[:80]!r}"
+            )
+            return 0
+        return written
+
+    @staticmethod
+    def _clip_seconds(descriptor: dict[str, Any]) -> int | None:
+        """Return a clip's length from the start and end in its id."""
+        parts = bare_identifier(descriptor["media_content_id"]).split("|", 6)
+        if len(parts) != 7:
+            return None
+        start = _parse_reolink_time(parts[5])
+        end = _parse_reolink_time(parts[6])
+        if start is None or end is None or end <= start:
+            return None
+        return int((end - start).total_seconds())
 
     @staticmethod
     def _camera_marker(descriptor: dict[str, Any]) -> str:
@@ -991,7 +1307,11 @@ class ReolinkClipCacheCoordinator:
         return f"{descriptor.get('camera')}"
 
     async def _async_direct_source(
-        self, descriptor: dict[str, Any], request_type_name: str = "DOWNLOAD"
+        self,
+        descriptor: dict[str, Any],
+        request_type_name: str = "DOWNLOAD",
+        plain_http: bool = False,
+        file_name: str | None = None,
     ) -> str | None:
         """Ask the Reolink integration for the NVR's own URL for a clip.
 
@@ -1004,6 +1324,8 @@ class ReolinkClipCacheCoordinator:
         if len(parts) != 7 or parts[0] != "FILE":
             return None
         _, entry_id, channel, stream, filename, start_id, end_id = parts
+        if file_name:
+            filename = file_name
 
         try:
             from homeassistant.components.reolink.util import get_host
@@ -1030,7 +1352,11 @@ class ReolinkClipCacheCoordinator:
             )
             return None
 
-        return url if url.startswith(("http://", "https://")) else None
+        if not url.startswith(("http://", "https://")):
+            return None
+        if plain_http:
+            return plain_http_url(url, getattr(api, "_netport_settings", None))
+        return url
 
     async def _async_download_with_retries(
         self, descriptor: dict[str, Any], dest: Path
@@ -1083,12 +1409,22 @@ class ReolinkClipCacheCoordinator:
         dest: Path,
         headers: dict[str, str] | None = None,
         label: str = "the Home Assistant proxy",
+        max_seconds: float | None = None,
+        timeout: float | None = None,
     ) -> int:
-        """Stream a URL to disk. Returns the number of bytes written."""
+        """Stream a URL to disk. Returns the number of bytes written.
+
+        ``max_seconds`` is for live streams such as FLV playback, which need
+        not end when the recording does: reading stops at that point, and a
+        stream the NVR cuts off still keeps what arrived.
+        """
         session = async_get_clientsession(self.hass, verify_ssl=False)
         written = 0
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max_seconds if max_seconds else None
+        limit = max(timeout or DOWNLOAD_TIMEOUT, (max_seconds or 0) + 30)
         try:
-            async with asyncio.timeout(DOWNLOAD_TIMEOUT):
+            async with asyncio.timeout(limit):
                 async with session.get(
                     url, headers=headers or DOWNLOAD_HEADERS
                 ) as response:
@@ -1100,7 +1436,7 @@ class ReolinkClipCacheCoordinator:
                         except Exception:  # noqa: BLE001
                             detail = "<unreadable body>"
                         self._last_status = response.status
-                        self._last_error = (
+                        self._last_error = redact(
                             f"HTTP {response.status} ({response.content_type})"
                             f"{f' {detail}' if detail else ''}"
                         )
@@ -1112,44 +1448,55 @@ class ReolinkClipCacheCoordinator:
                         ):
                             await self.hass.async_add_executor_job(handle.write, chunk)
                             written += len(chunk)
+                            if deadline is not None and loop.time() >= deadline:
+                                break
                     finally:
                         await self.hass.async_add_executor_job(handle.close)
         except TimeoutError:
-            self._last_error = f"timed out after {DOWNLOAD_TIMEOUT}s"
+            self._last_error = f"timed out after {limit:.0f}s"
             return 0
         except ClientError as err:
+            if deadline is not None and written:
+                # A playback stream that the NVR closes early is still a clip.
+                return written
             # Naming the exception type matters: a dropped connection, a
             # refused one and a bad response all read alike without it.
-            self._last_error = f"{type(err).__name__}: {err}"
+            self._last_error = redact(f"{type(err).__name__}: {err}")
             return 0
         if not written:
             self._last_error = "empty response"
         return written
 
-    async def _async_faststart(self, src: Path, dest: Path) -> None:
+    async def _async_faststart(self, src: Path, dest: Path) -> bool:
         """Move the MP4 index to the front so playback can start immediately.
 
         Without this the browser has to fetch the whole file before the first
         frame, which is a large part of the delay this integration removes.
+        An FLV recording is remuxed into MP4 the same way; it is useless to a
+        browser as it is, so it fails (returns False) if that cannot be done.
         """
+        head = await self.hass.async_add_executor_job(_read_head, src, 3)
+        is_flv = head.startswith(FLV_MAGIC)
+
         if binary := self._ffmpeg_binary():
-            ok = await self._run_ffmpeg(
-                binary,
-                "-y",
-                "-i",
-                str(src),
-                "-c",
-                "copy",
-                "-movflags",
-                "+faststart",
-                str(dest),
-            )
+            base = ["-y", *(["-f", "flv"] if is_flv else []), "-i", str(src)]
+            tail = ["-movflags", "+faststart", "-f", "mp4", str(dest)]
+            ok = await self._run_ffmpeg(binary, *base, "-c", "copy", *tail)
+            if not ok and is_flv:
+                # Some cameras put audio in their FLV that MP4 will not take
+                # as is. The picture is what matters here.
+                ok = await self._run_ffmpeg(binary, *base, "-c:v", "copy", "-an", *tail)
             if ok:
                 await self.hass.async_add_executor_job(_unlink, src)
-                return
+                return True
             _LOGGER.debug("Faststart failed for %s, storing as downloaded", src.name)
 
+        if is_flv:
+            await self.hass.async_add_executor_job(_unlink, dest)
+            self._last_error = "ffmpeg could not turn the FLV recording into MP4"
+            return False
         await self.hass.async_add_executor_job(shutil.move, str(src), str(dest))
+        return True
 
     async def _async_thumbnail(self, src: Path, dest: Path) -> bool:
         """Grab a poster frame for the filmstrip."""
@@ -1468,15 +1815,13 @@ class ReolinkClipCacheCoordinator:
 
         Waits first: the browser is streaming this very clip from the NVR, and
         NVRs serve only a few playback sessions at once, so a parallel download
-        would slow the play the user is waiting on.
+        would slow the play the user is waiting on. Not for a camera that only
+        works over FLV: Home Assistant's player asks that NVR for Download,
+        which it refuses, so nothing is streaming and the cache is the only way
+        the clip will play.
         """
         parts = bare_identifier(media_content_id).split("|", 6)
         if len(parts) != 7 or parts[0] != "FILE":
-            return
-
-        await asyncio.sleep(ON_DEMAND_CACHE_DELAY)
-        record = self._index.get(clip_id_for(media_content_id))
-        if record and record.get("cached_at"):
             return
 
         camera = next(
@@ -1488,6 +1833,12 @@ class ReolinkClipCacheCoordinator:
             None,
         )
         if camera is None:
+            return
+
+        if self._vod_types.get(camera.key) != "FLV":
+            await asyncio.sleep(ON_DEMAND_CACHE_DELAY)
+        record = self._index.get(clip_id_for(media_content_id))
+        if record and record.get("cached_at"):
             return
 
         start = _parse_reolink_time(parts[5])
@@ -1622,10 +1973,32 @@ class ReolinkClipCacheCoordinator:
             routes["library/download_vod"] = (
                 f"OK - {written} bytes" if written else self._last_error or "failed"
             )
-            for type_name in VOD_TYPE_LADDER:
-                url = await self._async_direct_source(descriptor, type_name)
-                routes[f"direct/{type_name}"] = (
-                    await self._async_probe(url, DIRECT_HEADERS)
+            for route in DIRECT_ROUTES:
+                request_type, plain_http = split_route(route)
+                url = await self._async_direct_source(
+                    descriptor, request_type, plain_http
+                )
+                routes[f"direct/{route}"] = (
+                    await self._async_probe(
+                        url, DIRECT_HEADERS, ranged=request_type != "FLV"
+                    )
+                    if url
+                    else "no URL for this request type"
+                )
+            native = await self._async_native_file(descriptor)
+            entry["native_file"] = native or self._last_error
+            for route in NATIVE_ROUTES:
+                if native is None:
+                    routes[f"native/{route}"] = "no native file name"
+                    continue
+                is_flv = route == NATIVE_FLV
+                url = await self._async_direct_source(
+                    descriptor, "FLV" if is_flv else "DOWNLOAD", False, native["name"]
+                )
+                if url and is_flv:
+                    url = with_seek(url, native["offset"])
+                routes[f"native/{route}"] = (
+                    await self._async_probe(url, DIRECT_HEADERS, ranged=not is_flv)
                     if url
                     else "no URL for this request type"
                 )
@@ -1644,24 +2017,42 @@ class ReolinkClipCacheCoordinator:
 
         return report
 
-    async def _async_probe(self, url: str, headers: dict[str, str]) -> str:
-        """Ask for the first slice of a clip and describe what came back."""
+    async def _async_probe(
+        self, url: str, headers: dict[str, str], ranged: bool = True
+    ) -> str:
+        """Ask for the first slice of a clip and describe what came back.
+
+        A playback stream (FLV) is not a file, so it is asked for without a
+        byte range and simply read until enough has arrived.
+        """
         session = async_get_clientsession(self.hass, verify_ssl=False)
-        probe = {**headers, "Range": "bytes=0-65535"}
+        probe = {**headers, "Range": "bytes=0-65535"} if ranged else dict(headers)
         try:
             async with asyncio.timeout(30):
                 async with session.get(url, headers=probe) as response:
-                    body = await response.content.read(65536)
-                    if response.status in OK_STATUSES:
-                        return f"OK - HTTP {response.status}, {len(body)} bytes, {response.content_type}"
-                    detail = body[:200].decode("utf-8", "replace").strip()
-                    return f"HTTP {response.status} ({response.content_type}) {detail}"
+                    if response.status not in OK_STATUSES:
+                        body = await response.content.read(65536)
+                        detail = body[:200].decode("utf-8", "replace").strip()
+                        return redact(
+                            f"HTTP {response.status} ({response.content_type}) {detail}"
+                        )
+                    body = b""
+                    while len(body) < 65536:
+                        chunk = await response.content.read(65536 - len(body))
+                        if not chunk:
+                            break
+                        body += chunk
+                    kind = ", FLV data" if body.startswith(FLV_MAGIC) else ""
+                    if not body:
+                        return f"HTTP {response.status} but no data"
+                    return (
+                        f"OK - HTTP {response.status}, {len(body)} bytes, "
+                        f"{response.content_type}{kind}"
+                    )
         except TimeoutError:
             return "timed out after 30s"
-        except ClientError as err:
-            return f"{type(err).__name__}: {err}"
         except Exception as err:  # noqa: BLE001
-            return f"{type(err).__name__}: {err}"
+            return redact(f"{type(err).__name__}: {err}")
 
     def stats(self) -> dict[str, Any]:
         """Return cache statistics for the status command and the sensors."""
@@ -1709,6 +2100,15 @@ def _open_write(path: Path):
     """Open a file for binary writing (executor)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     return path.open("wb")
+
+
+def _read_head(path: Path, size: int) -> bytes:
+    """Return the first bytes of a file, or nothing if it is gone (executor)."""
+    try:
+        with path.open("rb") as handle:
+            return handle.read(size)
+    except OSError:
+        return b""
 
 
 def _unlink(path: Path) -> None:
