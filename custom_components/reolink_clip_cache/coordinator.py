@@ -13,6 +13,7 @@ optimisation, never the source of truth.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 import re
@@ -72,6 +73,7 @@ from .const import (
     DOWNLOAD_SPACING,
     DOWNLOAD_TIMEOUT,
     EVENT_CLIP_CACHED,
+    EVENT_FETCH_LIMIT,
     EVENT_SETTLE_DELAY,
     FFMPEG_TIMEOUT,
     FLV_FALLBACK_SECONDS,
@@ -305,6 +307,11 @@ class ReolinkClipCacheCoordinator:
         self._semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
         self._in_flight: set[str] = set()
         self._sweep_lock = asyncio.Lock()
+        # New events and Play go ahead of a running sweep: while any is
+        # waiting, a sweep holds off before its next clip.
+        self._priority_jobs = 0
+        self._priority_idle = asyncio.Event()
+        self._priority_idle.set()
         self._last_sweep: dict[str, datetime] = {}
 
         self._unsubs: list[CALLBACK_TYPE] = []
@@ -572,7 +579,7 @@ class ReolinkClipCacheCoordinator:
 
         async def _run(_now: datetime) -> None:
             self._pending_sweeps.pop(camera_key, None)
-            await self.async_sweep(camera_key=camera_key)
+            await self.async_sweep_event(camera_key)
 
         self._pending_sweeps[camera_key] = async_call_later(
             self.hass, EVENT_SETTLE_DELAY, _run
@@ -618,6 +625,62 @@ class ReolinkClipCacheCoordinator:
             for camera in targets:
                 for day in days:
                     cached += await self._async_sweep_camera(camera, day, force)
+
+        if cached:
+            self._schedule_save()
+            async_dispatcher_send(self.hass, SIGNAL_INDEX_UPDATED)
+        return cached
+
+    @contextlib.asynccontextmanager
+    async def _priority(self):
+        """Hold a running sweep off before its next clip while this runs."""
+        self._priority_jobs += 1
+        self._priority_idle.clear()
+        try:
+            yield
+        finally:
+            self._priority_jobs -= 1
+            if not self._priority_jobs:
+                self._priority_idle.set()
+
+    async def async_sweep_event(self, camera_key: str) -> int:
+        """Cache a camera's newest clips right after a detection.
+
+        A running sweep (a Sweep now backfill can take a long time) holds the
+        sweep lock, so this does not wait for it: it lists today for the
+        camera and takes the next download slot, while the sweep holds off
+        before its next clip. Returns the number of clips newly cached.
+        """
+        camera = self._cameras.get(camera_key)
+        if camera is None or self._shutdown:
+            return 0
+        paused = self._backoff.get(camera.key)
+        if paused and dt_util.utcnow() < paused[0]:
+            return 0
+
+        cached = 0
+        async with self._priority():
+            try:
+                descriptors = await self.async_list_day(camera, dt_util.now().date())
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("Listing %s after a detection failed: %s", camera.name, err)
+                return 0
+            pending = [
+                descriptor
+                for descriptor in descriptors
+                if not self._is_cached(descriptor["clip_id"])
+                and self._clip_failures.get(descriptor["clip_id"], 0) < CLIP_FAILURE_LIMIT
+            ][:EVENT_FETCH_LIMIT]
+            for descriptor in pending:
+                if self._shutdown:
+                    break
+                try:
+                    if await self._async_cache_clip(descriptor):
+                        cached += 1
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    _LOGGER.exception("Unexpected error caching a clip")
 
         if cached:
             self._schedule_save()
@@ -676,6 +739,8 @@ class ReolinkClipCacheCoordinator:
                 break
             if index and DOWNLOAD_SPACING:
                 await asyncio.sleep(DOWNLOAD_SPACING)
+            # A new event or a Play press goes first.
+            await self._priority_idle.wait()
             try:
                 succeeded = await self._async_cache_clip(descriptor)
             except asyncio.CancelledError:
@@ -1918,7 +1983,11 @@ class ReolinkClipCacheCoordinator:
             None,
         ) or self._descriptor_for(camera, _StubChild(media_content_id, ""), day, None)
 
-        if descriptor and await self._async_cache_clip(descriptor):
+        if not descriptor:
+            return
+        async with self._priority():
+            newly = await self._async_cache_clip(descriptor)
+        if newly:
             self._schedule_save()
             async_dispatcher_send(self.hass, SIGNAL_INDEX_UPDATED)
 
