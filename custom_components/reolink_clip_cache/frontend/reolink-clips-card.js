@@ -16,7 +16,7 @@
  *   autoplay: false
  */
 
-const CARD_VERSION = '2.1.2';
+const CARD_VERSION = '2.3.0';
 
 // Signed clip and thumbnail URLs live for 30 minutes; refresh the list before then
 // so a wall tablet left on this card keeps working.
@@ -1482,8 +1482,28 @@ class ReolinkClipsCardEditor extends HTMLElement {
   }
 }
 
-if (!customElements.get('reolink-clips-card')) customElements.define('reolink-clips-card', ReolinkClipsCard);
-if (!customElements.get('reolink-clips-card-editor')) customElements.define('reolink-clips-card-editor', ReolinkClipsCardEditor);
+const ELEMENTS = [['reolink-clips-card', ReolinkClipsCard], ['reolink-clips-card-editor', ReolinkClipsCardEditor]];
+const register = () => ELEMENTS.forEach(([tag, cls]) => {
+  if (customElements.get(tag) === cls) return;
+  try { customElements.define(tag, cls); } catch (_) { /* an older copy owns the tag */ }
+});
+register();
+
+// Home Assistant's app bundle swaps window.customElements for a scoped registry
+// polyfill. The integration loads this card as an extra module, which can run
+// before that happens, and the polyfill's get() cannot see elements defined
+// before it took over: the dashboard then shows "Configuration error". Register
+// again with the new registry once it appears.
+const nativeRegistry = window.customElements;
+let registryChecks = 0;
+const registryWatch = setInterval(() => {
+  if (window.customElements !== nativeRegistry) {
+    register();
+    clearInterval(registryWatch);
+  } else if (++registryChecks >= 120) {
+    clearInterval(registryWatch);
+  }
+}, 250);
 
 window.customCards = window.customCards || [];
 if (!window.customCards.some((c) => c.type === 'reolink-clips-card')) window.customCards.push({
