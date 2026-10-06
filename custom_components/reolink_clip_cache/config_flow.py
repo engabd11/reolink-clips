@@ -31,6 +31,7 @@ from .const import (
     DEFAULT_SWEEP_MINUTES,
     DOMAIN,
     REOLINK_MEDIA_PREFIX,
+    TRIGGER_ALIASES,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -51,6 +52,22 @@ STREAM_OPTIONS = [
     {"value": "sub", "label": "Low resolution (H.264, plays in every browser)"},
     {"value": "main", "label": "High resolution (often H.265, plays only where the device decodes it)"},
 ]
+
+
+EVENT_TYPE_VALUES = [option["value"] for option in EVENT_TYPE_OPTIONS]
+
+
+def clean_event_types(values: Any) -> list[str]:
+    """Return only event types the form offers, in display order.
+
+    Older entries could hold "pet", which has no checkbox: the form would
+    carry it as a hidden selected value and refuse to save. Aliases map onto
+    the offered value ("pet" and "dog_cat" are "animal"), unknown values are
+    dropped, and an empty result falls back to the defaults.
+    """
+    wanted = {TRIGGER_ALIASES.get(str(v).lower(), str(v).lower()) for v in (values or [])}
+    cleaned = [v for v in EVENT_TYPE_VALUES if v in wanted]
+    return cleaned or [v for v in DEFAULT_EVENT_TYPES if v in EVENT_TYPE_VALUES]
 
 
 async def async_list_cameras(hass: HomeAssistant) -> list[dict[str, str]]:
@@ -85,7 +102,7 @@ def _schema(current: dict[str, Any], cameras: list[dict[str, str]]) -> vol.Schem
             ),
             vol.Required(
                 CONF_EVENT_TYPES,
-                default=current.get(CONF_EVENT_TYPES, DEFAULT_EVENT_TYPES),
+                default=clean_event_types(current.get(CONF_EVENT_TYPES, DEFAULT_EVENT_TYPES)),
             ): selector.SelectSelector(
                 selector.SelectSelectorConfig(
                     options=EVENT_TYPE_OPTIONS,
@@ -145,7 +162,7 @@ def _coerce(user_input: dict[str, Any]) -> dict[str, Any]:
     """Normalise the selector output, which returns numbers as floats."""
     return {
         CONF_CAMERAS: list(user_input.get(CONF_CAMERAS) or []),
-        CONF_EVENT_TYPES: list(user_input[CONF_EVENT_TYPES]),
+        CONF_EVENT_TYPES: clean_event_types(user_input[CONF_EVENT_TYPES]),
         CONF_STREAM: user_input[CONF_STREAM],
         CONF_CACHE_DAYS: int(user_input[CONF_CACHE_DAYS]),
         CONF_MAX_CACHE_MB: int(user_input[CONF_MAX_CACHE_MB]),

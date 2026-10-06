@@ -8,7 +8,7 @@ from typing import Final
 from homeassistant.const import Platform
 
 DOMAIN: Final = "reolink_clip_cache"
-VERSION: Final = "2.1.2"
+VERSION: Final = "2.1.3"
 
 PLATFORMS: Final = [Platform.SENSOR]
 
@@ -30,8 +30,11 @@ CACHEABLE_TRIGGERS: Final = [
     "face",
 ]
 
-# Triggers offered in the config flow, in display order.
-DEFAULT_EVENT_TYPES: Final = ["person", "vehicle", "pet", "animal"]
+# Triggers cached by default. Every value must be one the config flow offers:
+# a default the form cannot show stays hidden in the selection and fails
+# validation ("value must be one of ..."). Pets are covered by "animal"
+# through TRIGGER_ALIASES.
+DEFAULT_EVENT_TYPES: Final = ["person", "vehicle", "animal"]
 
 # Reolink groups pets and animals under different keys depending on model and
 # HA version; both surface as the same thing to a user.
