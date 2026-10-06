@@ -201,8 +201,10 @@ def _async_register_services(hass: HomeAssistant) -> None:
         today = dt_util.now().date()
         days = [today - timedelta(days=offset) for offset in range(call.data["days"])]
         for coordinator in _coordinators():
+            # A manual sweep ignores any pause after failed downloads and
+            # retries clips that failed before.
             cached = await coordinator.async_sweep(
-                camera_key=call.data.get("camera"), days=days
+                camera_key=call.data.get("camera"), days=days, force=True
             )
             _LOGGER.info("Manual sweep cached %d new clip(s)", cached)
 
