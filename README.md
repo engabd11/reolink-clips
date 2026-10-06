@@ -88,6 +88,7 @@ default_event_type: all         # all | person | vehicle | animal | package | vi
 thumbnails: true                # thumbnail filmstrip under the player
 autoplay: false                 # play the newest clip on load
 tab_labels: auto                # auto | names | icons
+overlay: always                 # always | hide_fullscreen | never
 camera_icons:                   # optional: your own icon per camera
   carport: mdi:garage
 ```
@@ -101,6 +102,7 @@ camera_icons:                   # optional: your own icon per camera
 | `thumbnails` | `true` | Show the filmstrip and prefetch adjacent clips |
 | `autoplay` | `false` | Start the newest clip automatically |
 | `tab_labels` | `auto` | Camera tabs sit on one row. `auto` shows names while they fit and icons when they would not; `names` or `icons` fixes one |
+| `overlay` | `always` | The clip details over the top of the video (event, time, cached). `hide_fullscreen` keeps them off fullscreen video, `never` hides them. The date and time on the right are dropped on a narrow player |
 | `camera_icons` | guessed | An icon per camera key. Otherwise it is guessed from the camera's name (door, doorbell, carport, yard, alley, gate…), falling back to a CCTV icon |
 
 ### Playback

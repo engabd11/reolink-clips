@@ -16,7 +16,7 @@
  *   autoplay: false
  */
 
-const CARD_VERSION = '2.3.2';
+const CARD_VERSION = '2.3.4';
 // How long Play waits for an uncached clip to be fetched into the cache.
 const CACHE_WAIT_MS = 300000;
 // Zoom limits for the player (pinch, wheel).
@@ -668,6 +668,11 @@ class ReolinkClipsCard extends HTMLElement {
   // ── Fullscreen ──────────────────────────────────────────────────────
 
   /** Fullscreen the player itself: the same <video>, so nothing downloads twice. */
+  _overlayMode() {
+    const mode = this._config && this._config.overlay;
+    return ['always', 'hide_fullscreen', 'never'].includes(mode) ? mode : 'always';
+  }
+
   _cameraIcon(camera) {
     const chosen = (this._config.camera_icons || {})[camera.key];
     return chosen || guessCameraIcon(camera.name);
@@ -1253,7 +1258,7 @@ class ReolinkClipsCard extends HTMLElement {
           <div class="event-chips" id="event-chips"></div>
         </div>
 
-        <div class="player" id="player">
+        <div class="player" id="player" data-overlay="${esc(this._overlayMode())}">
           <video id="video" playsinline preload="metadata"></video>
           <div class="player-placeholder" id="placeholder">
             <svg viewBox="0 0 24 24"><rect x="2" y="6" width="13" height="12" rx="2"/><path d="M22 8l-5 4 5 4V8z"/></svg>
@@ -1625,6 +1630,17 @@ class ReolinkClipsCard extends HTMLElement {
 
       .player-overlay { position: absolute; top: 12px; left: 12px; display: flex; gap: 6px; align-items: center; pointer-events: none; flex-wrap: wrap; }
       .player-overlay-right { position: absolute; top: 14px; right: 12px; pointer-events: none; }
+      /* The clip details over the video: always, not in fullscreen, or never. */
+      .player[data-overlay="never"] .player-overlay,
+      .player[data-overlay="never"] .player-overlay-right,
+      .player[data-overlay="hide_fullscreen"]:fullscreen .player-overlay,
+      .player[data-overlay="hide_fullscreen"]:fullscreen .player-overlay-right { display: none; }
+      /* Nothing to show before a clip loads. */
+      .clip-badge:empty, .clip-time-inner:empty { display: none; }
+      /* The date and time on the right repeat the time on the left: drop them
+         when the player is too narrow for both. */
+      .player { container-type: inline-size; }
+      @container (max-width: 480px) { .player-overlay-right { display: none; } }
       .player-cam-label {
         position: absolute; bottom: 12px; left: 12px; font-size: 10px; letter-spacing: 1px;
         color: rgba(255,255,255,.75); text-shadow: 0 1px 0 rgba(0,0,0,0.6);
@@ -1810,6 +1826,14 @@ class ReolinkClipsCardEditor extends HTMLElement {
       { name: 'thumbnails', selector: { boolean: {} } },
       { name: 'autoplay', selector: { boolean: {} } },
       {
+        name: 'overlay',
+        selector: { select: { mode: 'dropdown', options: [
+          { value: 'always', label: 'Always' },
+          { value: 'hide_fullscreen', label: 'Hide in fullscreen' },
+          { value: 'never', label: 'Never' },
+        ] } },
+      },
+      {
         name: 'tab_labels',
         selector: { select: { mode: 'dropdown', options: [
           { value: 'auto', label: 'Names, or icons when they do not fit' },
@@ -1850,6 +1874,7 @@ class ReolinkClipsCardEditor extends HTMLElement {
         thumbnails: 'Show the thumbnail filmstrip',
         autoplay: 'Play the newest clip automatically',
         tab_labels: 'Camera tabs',
+        overlay: 'Clip details over the video',
       }[schema.name] || (this._cameras.find((camera) => camera.key === schema.name) || {}).name || schema.name);
       this._form.addEventListener('value-changed', (event) => {
         const config = { ...this._config, ...event.detail.value };
@@ -1857,6 +1882,7 @@ class ReolinkClipsCardEditor extends HTMLElement {
         const icons = Object.fromEntries(Object.entries(config.camera_icons || {}).filter(([, icon]) => icon));
         if (Object.keys(icons).length) config.camera_icons = icons; else delete config.camera_icons;
         if (config.tab_labels === 'auto') delete config.tab_labels;
+        if (config.overlay === 'always') delete config.overlay;
         this.dispatchEvent(new CustomEvent('config-changed', {
           detail: { config },
           bubbles: true, composed: true,
@@ -1878,6 +1904,7 @@ class ReolinkClipsCardEditor extends HTMLElement {
       thumbnails: true,
       autoplay: false,
       tab_labels: 'auto',
+      overlay: 'always',
       ...this._config,
       camera_icons: this._config.camera_icons || {},
       cameras: (this._config.cameras || [])
