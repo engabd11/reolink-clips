@@ -1,5 +1,5 @@
 /**
- * Reolink Clips Card v2.1 (Cyborg dark, coffee and dark neon themes)
+ * Reolink Clips Card v2.1 (Cyborg dark, coffee, dark neon and soft dark themes)
  *
  * Companion card for the Reolink Clip Cache integration. A single
  * `reolink_clip_cache/clips` call returns a whole camera-day with signed local
@@ -120,7 +120,7 @@ class ReolinkClipsCard extends HTMLElement {
       ...config,
     };
     const t = String(this._config.theme || '').toLowerCase().replace(/[\s_]+/g, '-');
-    this.setAttribute('theme', t === 'coffee' ? 'coffee' : t === 'dark-neon' || t === 'neon' ? 'dark-neon' : 'dark');
+    this.setAttribute('theme', t === 'coffee' ? 'coffee' : t === 'dark-neon' || t === 'neon' ? 'dark-neon' : t === 'soft-dark' || t === 'soft' ? 'soft-dark' : 'dark');
     // Accept the 1.x shape (a list of {name, sensors}) as well as plain keys.
     this._cameraFilter = (this._config.cameras || [])
       .map((camera) => (typeof camera === 'string' ? camera : camera && camera.name))
@@ -1113,6 +1113,27 @@ class ReolinkClipsCard extends HTMLElement {
         --c-clay:  #F59E0B;
         --c-cache: #10B981;
       }
+      :host([theme="soft-dark"]) {
+        --onyx:        #0D0C0B;
+        --card-bg:     linear-gradient(180deg, #151412 0%, #0D0C0B 70%);
+        --coffee-800:  #1E1C1A;
+        --taupe:       #B3A08C;
+        --taupe-soft:  #D6C7B3;
+        --on-accent:   #171614;
+        --fg:          #ECE4D6;
+        --fg-dim:      #BDB09C;
+        --fg-muted:    #8A7E6D;
+        --line:        rgba(154,136,115,.20);
+        --line-strong: rgba(154,136,115,.35);
+        --glass:       rgba(236,228,214,.035);
+        --glass2:      rgba(236,228,214,.06);
+        --c-taupe: #BDB09C;
+        --c-sand:  #C9B58E;
+        --c-rust:  #B86B4A;
+        --c-moss:  #7A8D76;
+        --c-clay:  #A85A5D;
+        --c-cache: #7A8D76;
+      }
       :host([theme="dark-neon"]) .card { border-color: rgba(6,182,212,.22); box-shadow: 0 0 0 1px rgba(6,182,212,.05), 0 0 26px -8px rgba(6,182,212,.35), 0 30px 70px -30px rgba(0,0,0,.9); }
 
       .card {
@@ -1386,6 +1407,7 @@ class ReolinkClipsCardEditor extends HTMLElement {
           { value: 'dark', label: 'Dark (CAMusic OLED)' },
           { value: 'coffee', label: 'Coffee (warm)' },
           { value: 'dark-neon', label: 'Dark neon' },
+          { value: 'soft-dark', label: 'Soft dark' },
         ] } },
       },
       { name: 'title', selector: { text: {} } },
