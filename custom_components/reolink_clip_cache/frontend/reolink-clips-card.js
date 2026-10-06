@@ -1,5 +1,5 @@
 /**
- * Reolink Clips Card — Earthy Dark Edition v2.0
+ * Reolink Clips Card v2.1 (Cyborg dark and coffee themes)
  *
  * Companion card for the Reolink Clip Cache integration. A single
  * `reolink_clip_cache/clips` call returns a whole camera-day with signed local
@@ -16,7 +16,11 @@
  *   autoplay: false
  */
 
-const CARD_VERSION = '2.0.0';
+const CARD_VERSION = '2.1.0';
+
+// Signed clip and thumbnail URLs live for 30 minutes; refresh the list before then
+// so a wall tablet left on this card keeps working.
+const LIST_REFRESH_MS = 25 * 60 * 1000;
 
 const EVENT_META = {
   person:  { label: 'Person',  color: 'sand'  },
@@ -82,8 +86,11 @@ class ReolinkClipsCard extends HTMLElement {
 
     this._unsubEvents = null;
     this._detectionTimer = null;
+    this._refreshTimer = null;
+    this._loadToken = 0;           // newest _loadClips call wins
+    this._selectToken = 0;         // newest _selectClip call wins
+    this._pendingClip = null;      // uncached clip waiting for Play
     this._docClick = () => this._closeDropdowns();
-    this._docKeys = (event) => this._onFullscreenKey(event);
   }
 
   // ── Lovelace plumbing ───────────────────────────────────────────────
@@ -109,8 +116,10 @@ class ReolinkClipsCard extends HTMLElement {
       default_event_type: 'all',
       thumbnails: true,
       autoplay: false,
+      theme: 'dark',
       ...config,
     };
+    this.setAttribute('theme', this._config.theme === 'coffee' ? 'coffee' : 'dark');
     // Accept the 1.x shape (a list of {name, sensors}) as well as plain keys.
     this._cameraFilter = (this._config.cameras || [])
       .map((camera) => (typeof camera === 'string' ? camera : camera && camera.name))
@@ -141,9 +150,10 @@ class ReolinkClipsCard extends HTMLElement {
 
   disconnectedCallback() {
     document.removeEventListener('click', this._docClick);
-    document.removeEventListener('keydown', this._docKeys);
     if (this._detectionTimer) clearInterval(this._detectionTimer);
     this._detectionTimer = null;
+    if (this._refreshTimer) clearInterval(this._refreshTimer);
+    this._refreshTimer = null;
     if (this._unsubEvents) {
       this._unsubEvents.then((unsub) => unsub && unsub()).catch(() => {});
       this._unsubEvents = null;
@@ -204,6 +214,15 @@ class ReolinkClipsCard extends HTMLElement {
     if (this._detectionTimer) clearInterval(this._detectionTimer);
     // The "3m ago" labels need to tick even when no state changes arrive.
     this._detectionTimer = setInterval(() => this._refreshDetections(true), 30000);
+    if (this._refreshTimer) clearInterval(this._refreshTimer);
+    if (this._integration) {
+      this._refreshTimer = setInterval(() => {
+        const video = this.$('video');
+        // Leave a clip that is playing alone; refresh around it next time.
+        if (video && !video.paused) return;
+        this._loadClips({ silent: true, keepPosition: true });
+      }, LIST_REFRESH_MS);
+    }
   }
 
   _onClipCached(event) {
@@ -249,29 +268,32 @@ class ReolinkClipsCard extends HTMLElement {
   async _loadClips({ silent = false, keepPosition = false } = {}) {
     const camera = this._camera();
     if (!camera || !this._selectedDate) return;
-    if (this._loading) return;
 
+    // The newest request wins: switching camera or day mid-load discards the
+    // older answer instead of being blocked by it.
+    const token = ++this._loadToken;
+    const date = this._selectedDate;
     this._loading = true;
     if (!silent) this._setLoading(true);
     const previousId = keepPosition && this._clips[this._clipIndex]
       ? this._clips[this._clipIndex].media_content_id
       : null;
 
+    let clips;
     try {
-      this._allClips = this._integration
-        ? (await this._hass.callWS({
-            type: 'reolink_clip_cache/clips',
-            camera: camera.key,
-            date: this._selectedDate,
-          })).clips
-        : await this._fallbackClips(camera, this._selectedDate);
+      clips = this._integration
+        ? (await this._hass.callWS({ type: 'reolink_clip_cache/clips', camera: camera.key, date })).clips
+        : await this._fallbackClips(camera, date);
     } catch (err) {
+      if (token !== this._loadToken) return;
       this._allClips = [];
       this._loading = false;
       if (!silent) this._fail(err.message || 'Could not load clips.');
       return;
     }
+    if (token !== this._loadToken || camera !== this._camera()) return;
 
+    this._allClips = clips || [];
     this._loading = false;
     this._setLoading(false);
     this._applyFilterAndRender(previousId);
@@ -312,12 +334,15 @@ class ReolinkClipsCard extends HTMLElement {
 
   // ── Playback ────────────────────────────────────────────────────────
 
-  async _selectClip(index) {
+  async _selectClip(index, { play = false } = {}) {
     if (index < 0 || index >= this._clips.length) return;
+    const token = ++this._selectToken;
     this._clipIndex = index;
     this._retriedClip = null;
     const clip = this._clips[index];
     this._currentClipId = null;
+    this._pendingClip = null;
+    this._setError(null);
 
     const video = this.$('video');
     const placeholder = this.$('placeholder');
@@ -327,29 +352,53 @@ class ReolinkClipsCard extends HTMLElement {
     this._renderNav();
     this._renderFilmstrip();
 
-    let url = clip.url;
-    if (!url) {
-      this._setLoading(true);
-      url = await this._resolve(clip);
-      this._setLoading(false);
-    }
-    if (!url) {
-      this._retriedClip = clip.media_content_id;
-      this._showEmpty('This clip could not be loaded from the NVR.');
-      return;
-    }
-
     video.pause();
+    video.removeAttribute('src');
+    video.load();
     video.poster = clip.thumbnail || '';
-    video.src = url;
     video.style.display = 'block';
     placeholder.style.display = 'none';
     playBtn.classList.remove('hidden');
 
+    // A cached clip is a local, faststarted file: load it now so it starts at
+    // once. An uncached clip streams from the NVR, which is slow and holds one of
+    // its few playback sessions, so it is only fetched when Play is pressed.
+    if (!clip.url) {
+      this._pendingClip = clip;
+      this._setHint('Plays from the NVR, so it can take a few seconds to start');
+      if (play || this._config.autoplay) this._play();
+      return;
+    }
+    this._setHint('');
+    video.preload = 'metadata';
+    video.src = clip.url;
     this._currentClipId = clip.media_content_id;
-
-    if (this._config.autoplay) this._play();
+    if (token !== this._selectToken) return;
+    if (play || this._config.autoplay) this._play();
     this._prefetchNeighbours();
+  }
+
+  /** Resolve a clip that has no URL yet, then play it. */
+  async _playPending() {
+    const clip = this._pendingClip;
+    if (!clip) return false;
+    const token = this._selectToken;
+    this._setLoading(true);
+    const url = await this._resolve(clip);
+    if (token !== this._selectToken) return true;
+    this._pendingClip = null;
+    if (!url) {
+      this._setLoading(false);
+      this._setError('This clip could not be loaded from the NVR.');
+      return true;
+    }
+    const video = this.$('video');
+    video.preload = 'auto';
+    video.src = url;
+    this._currentClipId = clip.media_content_id;
+    this._setHint('');
+    video.play().then(() => this.$('play-btn').classList.add('hidden')).catch(() => {});
+    return true;
   }
 
   async _resolve(clip) {
@@ -393,17 +442,55 @@ class ReolinkClipsCard extends HTMLElement {
   }
 
   _onVideoError() {
+    const video = this.$('video');
+    if (!video.getAttribute('src')) return;
     const clip = this._clips[this._clipIndex];
-    if (!clip || this._retriedClip === clip.media_content_id) return;
+    this._setLoading(false);
+    const code = video.error && video.error.code;
+    // MEDIA_ERR_SRC_NOT_SUPPORTED on a file that downloaded fine is almost always
+    // an H.265 recording on a browser without a hardware decoder.
+    if (code === 4 && this._retriedClip === (clip && clip.media_content_id)) {
+      this._setError('This browser cannot play this clip. It is probably H.265: set the integration to the low resolution stream.');
+      return;
+    }
+    if (!clip || this._retriedClip === clip.media_content_id) {
+      this._setError('The clip stopped loading.');
+      return;
+    }
     // Signed URLs expire; ask for a fresh one once before giving up.
     this._retriedClip = clip.media_content_id;
     clip.url = null;
-    this._selectClip(this._clipIndex);
+    const retry = clip.media_content_id;
+    this._selectClip(this._clipIndex).then(() => {
+      if (this._clips[this._clipIndex]?.media_content_id === retry) {
+        this._retriedClip = retry;
+        this._playPending();
+      }
+    });
   }
 
   _play() {
+    if (this._pendingClip) { this._playPending(); return; }
     const video = this.$('video');
+    if (!video.getAttribute('src')) return;
     video.play().then(() => this.$('play-btn').classList.add('hidden')).catch(() => {});
+  }
+
+  _setHint(text) {
+    const el = this.$('hint');
+    if (!el) return;
+    el.textContent = text || '';
+    el.style.display = text ? 'block' : 'none';
+  }
+
+  _setError(text) {
+    const el = this.$('error');
+    if (!el) return;
+    el.style.display = text ? 'flex' : 'none';
+    if (text) {
+      el.querySelector('span').textContent = text;
+      this.$('play-btn').classList.add('hidden');
+    }
   }
 
   _togglePlay() {
@@ -415,51 +502,27 @@ class ReolinkClipsCard extends HTMLElement {
     }
   }
 
-  _prev() { if (this._clipIndex < this._clips.length - 1) this._selectClip(this._clipIndex + 1); }
-  _next() { if (this._clipIndex > 0) this._selectClip(this._clipIndex - 1); }
+  // In fullscreen, moving to the next clip keeps playing.
+  _isFullscreen() { return this.shadowRoot.fullscreenElement === this.$('player') || document.fullscreenElement === this; }
+  _prev() { if (this._clipIndex < this._clips.length - 1) this._selectClip(this._clipIndex + 1, { play: this._isFullscreen() }); }
+  _next() { if (this._clipIndex > 0) this._selectClip(this._clipIndex - 1, { play: this._isFullscreen() }); }
 
   // ── Fullscreen ──────────────────────────────────────────────────────
 
-  _openFullscreen() {
+  /** Fullscreen the player itself: the same <video>, so nothing downloads twice. */
+  _toggleFullscreen() {
+    const player = this.$('player');
     const video = this.$('video');
-    const fs = this.$('fs-video');
-    fs.src = video.src;
-    fs.poster = video.poster;
-    fs.currentTime = video.currentTime;
-    this.$('fs-title').textContent = (this._camera() || {}).name || '';
-    this.$('fs-subtitle').textContent = this.$('clip-name').textContent;
-    this.$('fs-overlay').classList.add('active');
-    video.pause();
-    fs.play().catch(() => {});
-    document.addEventListener('keydown', this._docKeys);
-  }
-
-  _closeFullscreen() {
-    const fs = this.$('fs-video');
-    const video = this.$('video');
-    video.currentTime = fs.currentTime;
-    fs.pause();
-    this.$('fs-overlay').classList.remove('active');
-    this.$('play-btn').classList.remove('hidden');
-    document.removeEventListener('keydown', this._docKeys);
-  }
-
-  _syncFullscreen() {
-    const fs = this.$('fs-video');
-    const video = this.$('video');
-    fs.src = video.src;
-    fs.poster = video.poster;
-    fs.play().catch(() => {});
-    this.$('fs-subtitle').textContent = this.$('clip-name').textContent;
-  }
-
-  _onFullscreenKey(event) {
-    if (!this.$('fs-overlay').classList.contains('active')) return;
-    if (event.key === 'Escape') this._closeFullscreen();
-    else if (event.key === 'ArrowLeft') { this._prev(); this._syncFullscreen(); }
-    else if (event.key === 'ArrowRight') { this._next(); this._syncFullscreen(); }
-    else return;
-    event.preventDefault();
+    if (this._isFullscreen()) {
+      (document.exitFullscreen || document.webkitExitFullscreen)?.call(document);
+      return;
+    }
+    if (player.requestFullscreen) {
+      player.requestFullscreen().catch(() => {});
+    } else if (video.webkitEnterFullscreen) {
+      // iPhone Safari only fullscreens video elements.
+      video.webkitEnterFullscreen();
+    }
   }
 
   _onCardKey(event) {
@@ -545,8 +608,8 @@ class ReolinkClipsCard extends HTMLElement {
     const hasNext = this._clipIndex > 0;
     this.$('prev-btn').disabled = !hasPrev;
     this.$('next-btn').disabled = !hasNext;
-    this.$('fs-prev').disabled = !hasPrev;
-    this.$('fs-next').disabled = !hasNext;
+    if (this.$('fs-prev')) this.$('fs-prev').disabled = !hasPrev;
+    if (this.$('fs-next')) this.$('fs-next').disabled = !hasNext;
     this.$('clip-index').textContent = this._clips.length
       ? `${this._clipIndex + 1} / ${this._clips.length}`
       : '— / —';
@@ -889,6 +952,16 @@ class ReolinkClipsCard extends HTMLElement {
           <button class="fullscreen-btn" id="fullscreen-btn" title="Fullscreen" aria-label="Fullscreen">
             <svg viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
           </button>
+          <div class="fs-nav">
+            <button class="fs-nav-btn" id="fs-prev" aria-label="Previous"><svg viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg></button>
+            <button class="fs-nav-btn" id="fs-next" aria-label="Next"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></button>
+          </div>
+          <div class="hint" id="hint" style="display:none"></div>
+          <div class="error" id="error" style="display:none">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v5M12 16h.01"/></svg>
+            <span></span>
+            <button class="retry-btn" id="retry-btn">Try again</button>
+          </div>
           <div class="loading" id="loading"><div class="spinner"></div></div>
         </div>
 
@@ -906,21 +979,6 @@ class ReolinkClipsCard extends HTMLElement {
         </div>
 
         <div class="filmstrip" id="filmstrip"></div>
-      </div>
-
-      <div class="fs-overlay" id="fs-overlay">
-        <div class="fs-video"><video id="fs-video" playsinline controls></video></div>
-        <div class="fs-info">
-          <div class="fs-title" id="fs-title">Camera</div>
-          <div class="fs-subtitle" id="fs-subtitle">Event</div>
-        </div>
-        <button class="fs-close" id="fs-close" aria-label="Close">
-          <svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-        </button>
-        <div class="fs-nav">
-          <button class="fs-nav-btn" id="fs-prev" aria-label="Previous"><svg viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg></button>
-          <button class="fs-nav-btn" id="fs-next" aria-label="Next"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></button>
-        </div>
       </div>
     `;
 
@@ -955,14 +1013,24 @@ class ReolinkClipsCard extends HTMLElement {
     video.addEventListener('click', () => this._togglePlay());
     video.addEventListener('ended', () => this.$('play-btn').classList.remove('hidden'));
     video.addEventListener('error', () => this._onVideoError());
+    // Show the spinner whenever playback is waiting on data, and only then.
+    video.addEventListener('waiting', () => this._setLoading(true));
+    video.addEventListener('stalled', () => { if (!video.paused) this._setLoading(true); });
+    for (const ev of ['playing', 'canplay', 'pause', 'emptied']) video.addEventListener(ev, () => this._setLoading(false));
+    video.addEventListener('playing', () => this.$('play-btn').classList.add('hidden'));
+    this.$('retry-btn').addEventListener('click', () => {
+      const clip = this._clips[this._clipIndex];
+      if (clip) clip.url = clip.cached ? clip.url : null;
+      this._selectClip(this._clipIndex, { play: true });
+    });
 
     this.$('prev-btn').addEventListener('click', () => this._prev());
     this.$('next-btn').addEventListener('click', () => this._next());
 
-    this.$('fullscreen-btn').addEventListener('click', () => this._openFullscreen());
-    this.$('fs-close').addEventListener('click', () => this._closeFullscreen());
-    this.$('fs-prev').addEventListener('click', () => { this._prev(); this._syncFullscreen(); });
-    this.$('fs-next').addEventListener('click', () => { this._next(); this._syncFullscreen(); });
+    this.$('fullscreen-btn').addEventListener('click', () => this._toggleFullscreen());
+    this.$('player').addEventListener('dblclick', () => this._toggleFullscreen());
+    this.$('fs-prev').addEventListener('click', () => this._prev());
+    this.$('fs-next').addEventListener('click', () => this._next());
 
     this.$('date-btn').addEventListener('click', (event) => {
       event.stopPropagation();
@@ -975,54 +1043,81 @@ class ReolinkClipsCard extends HTMLElement {
     return `
       *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+      /* Cyborg themes: dark is the CAMusic OLED look, coffee the warm espresso look. */
       :host {
-        --onyx:        #171614;
-        --coffee-800:  #3A2618;
-        --taupe:       #9A8873;
-        --taupe-soft:  #d6c7b3;
-        --fg:          #ece4d6;
-        --fg-dim:      #bdb09c;
-        --fg-muted:    #8a7e6d;
-        --line:        rgba(154,136,115,0.18);
-        --line-strong: rgba(154,136,115,0.30);
-        --c-taupe: #9A8873;
-        --c-rust:  #b86b4a;
-        --c-moss:  #7a8d76;
-        --c-clay:  #8a4d50;
-        --c-sand:  #c9b58e;
-        --c-cache: #4ade80;
-        --tint-taupe: rgba(154,136,115,0.16);
-        --tint-rust:  rgba(184,107, 74,0.18);
-        --tint-moss:  rgba(122,141,118,0.16);
-        --tint-clay:  rgba(138, 77, 80,0.20);
-        --tint-sand:  rgba(201,181,142,0.16);
-        --tint-cache: rgba(74,222,128,0.15);
-        --radius-card: 18px;
-        --radius-btn:  10px;
-        --radius-sm:   8px;
-        font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        display: block;
+        --onyx:        #050506;
+        --card-bg:     linear-gradient(180deg, #0B0C0E 0%, #000 62%);
+        --coffee-800:  #141518;
+        --taupe:       #D9A85C;
+        --taupe-soft:  #F0D2A0;
+        --on-accent:   #0B0B0C;
+        --fg:          #FFFFFF;
+        --fg-dim:      rgba(255,255,255,.70);
+        --fg-muted:    rgba(255,255,255,.45);
+        --line:        rgba(255,255,255,.09);
+        --line-strong: rgba(255,255,255,.16);
+        --glass:       rgba(255,255,255,.04);
+        --glass2:      rgba(255,255,255,.07);
+        --c-taupe: rgba(255,255,255,.62);
+        --c-sand:  #D9A85C;
+        --c-rust:  #7A8FD9;
+        --c-moss:  #3ECF7A;
+        --c-clay:  #E8A42C;
+        --c-cache: #3ECF7A;
+        --radius-card: 22px;
+        --radius-btn:  12px;
+        --radius-sm:   9px;
+        font-family: Manrope, Inter, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+      }
+      :host([theme="coffee"]) {
+        --onyx:        #141210;
+        --card-bg:     linear-gradient(180deg, #1F1C17 0%, #141210 70%);
+        --coffee-800:  #26231D;
+        --taupe:       #E4A667;
+        --taupe-soft:  #F2C9A0;
+        --on-accent:   #1A1209;
+        --fg:          #F5F3EF;
+        --fg-dim:      #C9C3B8;
+        --fg-muted:    #8F887C;
+        --line:        #302C25;
+        --line-strong: #403B32;
+        --glass:       rgba(245,236,220,.045);
+        --glass2:      rgba(245,236,220,.075);
+        --c-taupe: #C9C3B8;
+        --c-sand:  #E4A667;
+        --c-rust:  #8FA6E0;
+        --c-moss:  #7BC68F;
+        --c-clay:  #E8A42C;
       }
 
       .card {
-        background: var(--onyx);
+        position: relative; isolation: isolate; overflow: hidden;
+        background: var(--card-bg);
         border: 1px solid var(--line);
         border-radius: var(--radius-card);
-        padding: 14px; color: var(--fg);
+        padding: 16px; color: var(--fg);
         display: flex; flex-direction: column; gap: 12px;
         outline: none;
+        box-shadow: 0 30px 70px -30px rgba(0,0,0,.85);
+        -webkit-font-smoothing: antialiased;
       }
-      .card:focus-visible { border-color: var(--line-strong); box-shadow: 0 0 0 2px rgba(154,136,115,0.25); }
+      .card::before {
+        content: ""; position: absolute; inset: -40% 30% auto -30%; height: 90%; z-index: -1; pointer-events: none;
+        background: radial-gradient(closest-side, color-mix(in srgb, var(--taupe) 16%, transparent), transparent);
+      }
+      .card:focus-visible { border-color: var(--line-strong); box-shadow: 0 0 0 2px color-mix(in srgb, var(--taupe) 40%, transparent); }
 
       .header { display: flex; flex-direction: column; gap: 8px; }
       .header-top { display: flex; align-items: center; gap: 12px; }
       .hue-icon {
-        width: 44px; height: 44px; border-radius: 10px; background: var(--taupe);
+        width: 40px; height: 40px; border-radius: 12px; background: color-mix(in srgb, var(--taupe) 14%, transparent); border: 1px solid color-mix(in srgb, var(--taupe) 26%, transparent);
         display: flex; align-items: center; justify-content: center; flex-shrink: 0;
         box-shadow: 0 2px 0 rgba(0,0,0,0.25), inset 0 1px 0 rgba(255,255,255,0.08);
       }
-      .hue-icon svg { width: 22px; height: 22px; stroke: #1a130d; fill: none; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+      .hue-icon svg { width: 20px; height: 20px; stroke: var(--taupe); fill: none; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
       .header-left { flex: 1; min-width: 0; }
-      .title { font-size: 18px; font-weight: 700; letter-spacing: 0.1px; }
+      .title { font-size: 15px; font-weight: 800; letter-spacing: -.01em; }
       .subtitle { font-size: 12px; color: var(--fg-muted); margin-top: 2px; font-weight: 500; }
 
       #last-detection { display: none; grid-template-columns: repeat(auto-fit, minmax(0, 1fr)); gap: 5px; max-width: 480px; }
@@ -1037,11 +1132,13 @@ class ReolinkClipsCard extends HTMLElement {
       .det-time { opacity: 0.65; }
       @keyframes pulse { 0%,100% { opacity: 0.35; transform: scale(0.85); } 50% { opacity: 1; transform: scale(1.1); } }
 
-      .sand  { background: var(--tint-sand);  border: 1px solid rgba(201,181,142,0.35); color: var(--c-sand); }
-      .rust  { background: var(--tint-rust);  border: 1px solid rgba(184,107,74,0.40);  color: #d4906f; }
-      .moss  { background: var(--tint-moss);  border: 1px solid rgba(122,141,118,0.38); color: #a3b89e; }
-      .clay  { background: var(--tint-clay);  border: 1px solid rgba(138,77,80,0.38);   color: #e3b9bb; }
-      .taupe { background: var(--tint-taupe); border: 1px solid rgba(154,136,115,0.35); color: var(--taupe-soft); }
+      .sand, .rust, .moss, .clay, .taupe {
+        background: color-mix(in srgb, var(--ec) 13%, transparent);
+        border: 1px solid color-mix(in srgb, var(--ec) 36%, transparent);
+        color: var(--ec);
+      }
+      .sand { --ec: var(--c-sand); } .rust { --ec: var(--c-rust); } .moss { --ec: var(--c-moss); }
+      .clay { --ec: var(--c-clay); } .taupe { --ec: var(--c-taupe); }
       .sand  .det-dot, .sand  .evt-dot { background: var(--c-sand);  }
       .rust  .det-dot, .rust  .evt-dot { background: var(--c-rust);  }
       .moss  .det-dot, .moss  .evt-dot { background: var(--c-moss);  }
@@ -1049,42 +1146,35 @@ class ReolinkClipsCard extends HTMLElement {
       .taupe .det-dot, .taupe .evt-dot { background: var(--c-taupe); }
 
       .refresh-btn {
-        height: 44px; padding: 0 14px; background: rgba(255,255,255,0.025);
+        height: 40px; padding: 0 14px; background: var(--glass);
         border: 1px solid var(--line); border-radius: var(--radius-btn);
         color: var(--fg-dim); cursor: pointer; display: flex; align-items: center;
         justify-content: center; gap: 6px; flex-shrink: 0; white-space: nowrap;
         font-size: 12px; font-weight: 600; letter-spacing: 0.3px; transition: background 0.15s, color 0.15s;
       }
-      .refresh-btn:hover { background: rgba(255,255,255,0.04); color: var(--fg); }
+      .refresh-btn:hover { background: var(--glass2); color: var(--fg); }
       .refresh-btn svg { width: 15px; height: 15px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 
       .camera-tabs { display: grid; grid-template-columns: repeat(${cols}, 1fr); gap: 8px; }
       .cam-tab {
         height: 40px; font-size: 12px; font-weight: 600; letter-spacing: 0.6px;
         text-transform: uppercase; background: transparent; border: 1px solid var(--line);
-        border-radius: var(--radius-btn); color: var(--fg-muted); cursor: pointer; transition: all 0.15s;
+        border-radius: var(--radius-btn); color: var(--fg-muted); cursor: pointer; transition: all 0.15s; font-family: inherit;
         overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0 8px;
       }
-      .cam-tab:hover { background: rgba(255,255,255,0.02); }
-      .cam-tab[data-idx="0"] { color: var(--c-taupe); }
-      .cam-tab[data-idx="1"] { color: var(--c-moss);  }
-      .cam-tab[data-idx="2"] { color: var(--c-clay);  }
-      .cam-tab[data-idx="3"] { color: var(--c-rust);  }
-      .cam-tab.active[data-idx="0"] { background: var(--tint-taupe); color: var(--taupe-soft); border: 1.5px solid var(--c-taupe); }
-      .cam-tab.active[data-idx="1"] { background: var(--tint-moss);  color: #c2d4bd; border: 1.5px solid var(--c-moss); }
-      .cam-tab.active[data-idx="2"] { background: var(--tint-clay);  color: #e3b9bb; border: 1.5px solid var(--c-clay); }
-      .cam-tab.active[data-idx="3"] { background: var(--tint-rust);  color: #e8b89a; border: 1.5px solid var(--c-rust); }
+      .cam-tab:hover { background: var(--glass); color: var(--fg); }
+      .cam-tab.active { background: var(--taupe); color: var(--on-accent); border-color: var(--taupe); box-shadow: 0 6px 16px -6px color-mix(in srgb, var(--taupe) 80%, transparent); }
 
       .filter-row { display: grid; grid-template-columns: minmax(120px, 180px) 1fr; gap: 10px; position: relative; z-index: 10; align-items: start; }
       @media (max-width: 460px) { .filter-row { grid-template-columns: 1fr; } }
       .dropdown { position: relative; }
       .dropdown-btn {
         width: 100%; height: 40px; padding: 0 12px; font-size: 13px; font-weight: 500;
-        background: rgba(255,255,255,0.025); border: 1px solid var(--line);
-        border-radius: var(--radius-btn); color: var(--fg); cursor: pointer;
+        background: var(--glass); border: 1px solid var(--line);
+        border-radius: var(--radius-btn); color: var(--fg); cursor: pointer; font-family: inherit;
         display: flex; align-items: center; gap: 8px; transition: border-color 0.15s, background 0.15s;
       }
-      .dropdown-btn:hover { border-color: var(--line-strong); background: rgba(255,255,255,0.045); }
+      .dropdown-btn:hover { border-color: var(--line-strong); background: var(--glass2); }
       .dropdown-btn .label { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; overflow: hidden; }
       .dropdown-btn .label span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .dropdown-btn .lead { color: var(--taupe); display: inline-flex; }
@@ -1102,8 +1192,8 @@ class ReolinkClipsCard extends HTMLElement {
         padding: 9px 11px; font-size: 12px; font-weight: 500; color: var(--fg);
         cursor: pointer; border-radius: var(--radius-sm); transition: background 0.15s;
       }
-      .dropdown-option:hover { background: rgba(154,136,115,0.12); }
-      .dropdown-option.active { background: rgba(117,64,67,0.2); color: #e3b9bb; }
+      .dropdown-option:hover { background: var(--glass2); }
+      .dropdown-option.active { background: var(--taupe); color: var(--on-accent); }
       .dropdown-menu::-webkit-scrollbar { width: 4px; }
       .dropdown-menu::-webkit-scrollbar-thumb { background: var(--fg-muted); border-radius: 2px; }
 
@@ -1118,8 +1208,8 @@ class ReolinkClipsCard extends HTMLElement {
       .evt-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
       .evt-count { opacity: 0.6; font-weight: 500; font-variant-numeric: tabular-nums; }
 
-      .player { position: relative; aspect-ratio: 16/9; background: #0c0a09; border-radius: 14px; overflow: hidden; border: 1px solid var(--line); }
-      .player video { width: 100%; height: 100%; object-fit: contain; display: none; background: #0c0a09; }
+      .player { position: relative; aspect-ratio: 16/9; background: #000; border-radius: 16px; overflow: hidden; border: 1px solid var(--line); }
+      .player video { width: 100%; height: 100%; object-fit: contain; display: none; background: #000; }
       .player-placeholder { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: var(--fg-muted); }
       .player-placeholder svg { width: 44px; height: 44px; stroke: var(--fg-muted); fill: none; stroke-width: 1.5; opacity: 0.4; }
       .player-placeholder span { font-size: 13px; text-align: center; padding: 0 20px; }
@@ -1127,18 +1217,18 @@ class ReolinkClipsCard extends HTMLElement {
       .play-btn { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; cursor: pointer; }
       .play-btn.hidden { display: none; }
       .play-btn-icon {
-        width: 78px; height: 78px; background: rgba(23,22,20,0.5); border: 2px solid var(--taupe);
+        width: 72px; height: 72px; background: var(--taupe); border: 0; box-shadow: 0 10px 26px -6px color-mix(in srgb, var(--taupe) 70%, transparent);
         border-radius: 50%; display: flex; align-items: center; justify-content: center;
         transition: transform 0.2s, background 0.2s, box-shadow 0.2s;
       }
-      .play-btn:hover .play-btn-icon { background: rgba(23,22,20,0.75); transform: scale(1.05); box-shadow: 0 0 0 10px rgba(154,136,115,0.12); }
-      .play-btn-icon svg { width: 28px; height: 28px; fill: var(--taupe); transform: translateX(2px); }
+      .play-btn:hover .play-btn-icon { transform: scale(1.06); }
+      .play-btn-icon svg { width: 28px; height: 28px; fill: var(--on-accent); transform: translateX(2px); }
 
       .player-overlay { position: absolute; top: 12px; left: 12px; display: flex; gap: 6px; align-items: center; pointer-events: none; flex-wrap: wrap; }
       .player-overlay-right { position: absolute; top: 14px; right: 12px; pointer-events: none; }
       .player-cam-label {
         position: absolute; bottom: 12px; left: 12px; font-size: 10px; letter-spacing: 1px;
-        color: rgba(214,199,179,0.75); text-shadow: 0 1px 0 rgba(0,0,0,0.6);
+        color: rgba(255,255,255,.75); text-shadow: 0 1px 0 rgba(0,0,0,0.6);
         text-transform: uppercase; pointer-events: none; font-family: 'JetBrains Mono', monospace;
       }
       .clip-badge {
@@ -1150,40 +1240,40 @@ class ReolinkClipsCard extends HTMLElement {
       .cache-badge {
         display: inline-flex; align-items: center; gap: 4px; height: 22px; padding: 0 7px;
         border-radius: 6px; font-size: 9px; font-weight: 700; letter-spacing: 0.8px;
-        background: var(--tint-cache); border: 1px solid rgba(74,222,128,0.30); color: var(--c-cache);
+        background: color-mix(in srgb, var(--c-cache) 15%, transparent); border: 1px solid color-mix(in srgb, var(--c-cache) 35%, transparent); color: var(--c-cache);
       }
       .cache-badge svg { width: 10px; height: 10px; stroke: currentColor; fill: none; stroke-width: 2.4; }
       .clip-time-inner {
         display: inline-flex; align-items: center; height: 28px; padding: 0 10px;
-        background: rgba(15,11,9,0.78); color: var(--fg); border-radius: 8px;
+        background: rgba(0,0,0,.65); color: #fff; border-radius: 8px;
         font-size: 12px; font-weight: 600; border: 1px solid var(--line);
         font-family: 'JetBrains Mono', monospace;
       }
-      .clip-time-badge { font-size: 10px; color: rgba(214,199,179,0.75); letter-spacing: 1px; text-shadow: 0 1px 0 rgba(0,0,0,0.6); font-family: 'JetBrains Mono', monospace; }
+      .clip-time-badge { font-size: 10px; color: rgba(255,255,255,.75); letter-spacing: 1px; text-shadow: 0 1px 0 rgba(0,0,0,0.6); font-family: 'JetBrains Mono', monospace; }
 
       .fullscreen-btn {
         position: absolute; bottom: 10px; right: 10px; width: 34px; height: 34px;
-        background: rgba(15,11,9,0.55); border: 1px solid var(--line); border-radius: 8px;
+        background: rgba(0,0,0,.55); border: 1px solid rgba(255,255,255,.14); border-radius: 10px;
         cursor: pointer; display: flex; align-items: center; justify-content: center;
         opacity: 0; transition: opacity 0.2s;
       }
       .player:hover .fullscreen-btn { opacity: 1; }
       @media (hover: none) { .fullscreen-btn { opacity: 0.8; } }
-      .fullscreen-btn svg { width: 17px; height: 17px; stroke: var(--fg); fill: none; stroke-width: 2; }
+      .fullscreen-btn svg { width: 17px; height: 17px; stroke: #fff; fill: none; stroke-width: 2; }
 
-      .loading { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(15,11,9,0.5); }
+      .loading { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,.35); pointer-events: none; }
       .loading.active { display: flex; }
-      .spinner { width: 36px; height: 36px; border: 2px solid rgba(154,136,115,0.15); border-top-color: var(--taupe); border-radius: 50%; animation: spin 0.9s linear infinite; }
+      .spinner { width: 36px; height: 36px; border: 3px solid rgba(255,255,255,.14); border-top-color: var(--taupe); border-radius: 50%; animation: spin 0.9s linear infinite; }
       @keyframes spin { to { transform: rotate(360deg); } }
 
       .clips-nav { display: grid; grid-template-columns: 40px 1fr 40px; align-items: center; gap: 8px; }
       .nav-btn {
-        width: 40px; height: 40px; background: rgba(255,255,255,0.025);
+        width: 40px; height: 40px; background: var(--glass);
         border: 1px solid var(--line); border-radius: var(--radius-btn);
         color: var(--fg-dim); cursor: pointer; display: flex; align-items: center;
         justify-content: center; transition: all 0.15s;
       }
-      .nav-btn:hover:not(:disabled) { background: rgba(255,255,255,0.04); color: var(--taupe); border-color: var(--line-strong); }
+      .nav-btn:hover:not(:disabled) { background: var(--glass2); color: var(--taupe); border-color: var(--line-strong); }
       .nav-btn:disabled { opacity: 0.45; cursor: not-allowed; }
       .nav-btn svg { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
       .clip-info { text-align: center; min-width: 0; }
@@ -1200,7 +1290,7 @@ class ReolinkClipsCard extends HTMLElement {
       .thumb {
         position: relative; flex: 0 0 auto; width: 104px; height: 62px; padding: 0;
         border-radius: var(--radius-sm); overflow: hidden; cursor: pointer;
-        background: #0c0a09; border: 1.5px solid var(--line);
+        background: #000; border: 1.5px solid var(--line);
         scroll-snap-align: center; transition: border-color 0.15s, transform 0.15s;
       }
       .thumb:hover { transform: translateY(-1px); }
@@ -1210,34 +1300,30 @@ class ReolinkClipsCard extends HTMLElement {
       .thumb-fallback svg { width: 22px; height: 22px; stroke: currentColor; fill: none; stroke-width: 1.6; opacity: 0.5; }
       .thumb-time {
         position: absolute; bottom: 0; left: 0; right: 0; padding: 2px 4px;
-        font-size: 10px; font-weight: 600; color: #ece4d6;
-        background: linear-gradient(transparent, rgba(12,10,9,0.9));
+        font-size: 10px; font-weight: 700; color: #fff;
+        background: linear-gradient(transparent, rgba(0,0,0,.85));
         font-family: 'JetBrains Mono', monospace; letter-spacing: 0.2px;
       }
-      .thumb-cached { position: absolute; top: 4px; right: 4px; width: 6px; height: 6px; border-radius: 50%; background: var(--c-cache); box-shadow: 0 0 0 2px rgba(12,10,9,0.6); }
+      .thumb-cached { position: absolute; top: 4px; right: 4px; width: 6px; height: 6px; border-radius: 50%; background: var(--c-cache); box-shadow: 0 0 0 2px rgba(0,0,0,.6); }
 
-      .fs-overlay { display: none; position: fixed; inset: 0; background: #0c0a09; z-index: 999999; flex-direction: column; }
-      .fs-overlay.active { display: flex; }
-      .fs-video { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 0; }
-      .fs-video video { width: 100%; height: 100%; object-fit: contain; }
-      .fs-close {
-        position: fixed; top: 16px; right: 16px; width: 44px; height: 44px;
-        background: rgba(15,11,9,0.75); border: 1px solid var(--line-strong);
-        border-radius: 12px; cursor: pointer; display: flex; align-items: center;
-        justify-content: center; z-index: 1000000;
-      }
-      .fs-close svg { width: 24px; height: 24px; stroke: var(--fg); fill: none; stroke-width: 2; stroke-linecap: round; }
-      .fs-info { position: fixed; top: 20px; left: 20px; z-index: 1000000; }
-      .fs-title { font-size: 18px; font-weight: 700; color: var(--fg); margin-bottom: 4px; }
-      .fs-subtitle { font-size: 13px; color: var(--fg-muted); }
-      .fs-nav { position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%); display: flex; gap: 12px; z-index: 1000000; }
+      .hint { position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); max-width: 90%; padding: 5px 10px; border-radius: 999px;
+        background: rgba(0,0,0,.6); color: rgba(255,255,255,.8); font-size: 11px; text-align: center; pointer-events: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .error { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 16px;
+        background: rgba(0,0,0,.72); color: #fff; text-align: center; font-size: 13px; }
+      .error svg { width: 30px; height: 30px; stroke: var(--c-clay); fill: none; stroke-width: 2; stroke-linecap: round; }
+      .retry-btn { height: 36px; padding: 0 16px; border-radius: 999px; border: 0; background: var(--taupe); color: var(--on-accent); font: inherit; font-weight: 800; cursor: pointer; }
+      .fs-nav { display: none; position: absolute; bottom: 24px; left: 50%; transform: translateX(-50%); gap: 12px; }
+      .player:fullscreen { border-radius: 0; border: 0; aspect-ratio: auto; }
+      .player:fullscreen .fs-nav { display: flex; }
+      .player:fullscreen .fullscreen-btn { opacity: .8; }
       .fs-nav-btn {
-        width: 52px; height: 52px; background: rgba(15,11,9,0.75);
-        border: 1px solid var(--line-strong); border-radius: 14px; cursor: pointer;
+        width: 52px; height: 52px; background: rgba(0,0,0,.6);
+        border: 1px solid rgba(255,255,255,.18); border-radius: 16px; cursor: pointer;
         display: flex; align-items: center; justify-content: center;
       }
-      .fs-nav-btn:disabled { opacity: 0.45; cursor: not-allowed; }
-      .fs-nav-btn svg { width: 26px; height: 26px; stroke: var(--fg); fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+      .fs-nav-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+      .fs-nav-btn svg { width: 26px; height: 26px; stroke: #fff; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+      @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition-duration: .01ms !important; } }
     `;
   }
 }
@@ -1270,6 +1356,13 @@ class ReolinkClipsCardEditor extends HTMLElement {
 
   _schema() {
     return [
+      {
+        name: 'theme',
+        selector: { select: { mode: 'dropdown', options: [
+          { value: 'dark', label: 'Dark (CAMusic OLED)' },
+          { value: 'coffee', label: 'Coffee (warm)' },
+        ] } },
+      },
       { name: 'title', selector: { text: {} } },
       {
         name: 'cameras',
@@ -1305,6 +1398,7 @@ class ReolinkClipsCardEditor extends HTMLElement {
       this.innerHTML = '';
       this._form = document.createElement('ha-form');
       this._form.computeLabel = (schema) => ({
+        theme: 'Theme',
         title: 'Card title',
         cameras: 'Cameras (all if none selected)',
         default_event_type: 'Event type shown first',
@@ -1327,6 +1421,7 @@ class ReolinkClipsCardEditor extends HTMLElement {
     if (this._hass) this._form.hass = this._hass;
     this._form.schema = this._schema();
     this._form.data = {
+      theme: 'dark',
       title: 'Events',
       default_event_type: 'all',
       thumbnails: true,
@@ -1338,11 +1433,11 @@ class ReolinkClipsCardEditor extends HTMLElement {
   }
 }
 
-customElements.define('reolink-clips-card', ReolinkClipsCard);
-customElements.define('reolink-clips-card-editor', ReolinkClipsCardEditor);
+if (!customElements.get('reolink-clips-card')) customElements.define('reolink-clips-card', ReolinkClipsCard);
+if (!customElements.get('reolink-clips-card-editor')) customElements.define('reolink-clips-card-editor', ReolinkClipsCardEditor);
 
 window.customCards = window.customCards || [];
-window.customCards.push({
+if (!window.customCards.some((c) => c.type === 'reolink-clips-card')) window.customCards.push({
   type: 'reolink-clips-card',
   name: 'Reolink Clips Card',
   description: 'Person, vehicle and animal clips from your Reolink NVR, played instantly from the local cache.',

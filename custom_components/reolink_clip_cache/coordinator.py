@@ -75,6 +75,7 @@ from .const import (
     REOLINK_DOMAIN,
     REOLINK_MEDIA_PREFIX,
     SIGNAL_INDEX_UPDATED,
+    ON_DEMAND_CACHE_DELAY,
     SIGNED_URL_TTL,
     STORAGE_DIR_NAME,
     STORAGE_KEY,
@@ -1306,12 +1307,43 @@ class ReolinkClipCacheCoordinator:
             _LOGGER.debug("Fallback resolve failed for %s: %s", media_content_id, err)
             return {"cached": False, "clip_id": clip_id, "url": None}
 
-        return {"cached": False, "clip_id": clip_id, "url": media.url}
+        return {
+            "cached": False,
+            "clip_id": clip_id,
+            "url": self._signed_media_url(media.url, refresh_token_id),
+        }
+
+    def _signed_media_url(self, url: str, refresh_token_id: str | None) -> str:
+        """Sign a relative media source URL for the browser.
+
+        The Reolink proxy view requires authentication, and a <video> element
+        cannot send the bearer token, so a bare /api/reolink/video/... path is
+        refused with 401. The media_source/resolve_media websocket command signs
+        its URLs; resolving in Python does not, so sign it here the same way.
+        """
+        if url.startswith(("http://", "https://")):
+            return url
+        return async_sign_path(
+            self.hass,
+            url,
+            timedelta(seconds=SIGNED_URL_TTL),
+            refresh_token_id=refresh_token_id,
+        )
 
     async def _async_cache_on_demand(self, media_content_id: str) -> None:
-        """Cache a single clip the card asked for."""
+        """Cache a single clip the card asked for.
+
+        Waits first: the browser is streaming this very clip from the NVR, and
+        NVRs serve only a few playback sessions at once, so a parallel download
+        would slow the play the user is waiting on.
+        """
         parts = bare_identifier(media_content_id).split("|", 6)
         if len(parts) != 7 or parts[0] != "FILE":
+            return
+
+        await asyncio.sleep(ON_DEMAND_CACHE_DELAY)
+        record = self._index.get(clip_id_for(media_content_id))
+        if record and record.get("cached_at"):
             return
 
         camera = next(
