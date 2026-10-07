@@ -1,5 +1,5 @@
 /**
- * Reolink Clips Card v2.1 (Cyborg dark, coffee, dark neon and soft dark themes)
+ * Reolink Clips Card (Cyborg dark, coffee, dark neon, soft dark and onyx themes)
  *
  * Companion card for the Reolink Clip Cache integration. A single
  * `reolink_clip_cache/clips` call returns a whole camera-day with signed local
@@ -16,7 +16,7 @@
  *   autoplay: false
  */
 
-const CARD_VERSION = '2.3.4';
+const CARD_VERSION = '2.3.5';
 // How long Play waits for an uncached clip to be fetched into the cache.
 const CACHE_WAIT_MS = 300000;
 // Zoom limits for the player (pinch, wheel).
@@ -172,7 +172,12 @@ class ReolinkClipsCard extends HTMLElement {
       ...config,
     };
     const t = String(this._config.theme || '').toLowerCase().replace(/[\s_]+/g, '-');
-    this.setAttribute('theme', t === 'coffee' ? 'coffee' : t === 'dark-neon' || t === 'neon' ? 'dark-neon' : t === 'soft-dark' || t === 'soft' ? 'soft-dark' : 'dark');
+    this.setAttribute('theme', t === 'coffee' ? 'coffee' : t === 'dark-neon' || t === 'neon' ? 'dark-neon' : t === 'soft-dark' || t === 'soft' ? 'soft-dark'
+      : t === 'onyx' || t === 'advisor' || t === 'weather-dark' ? 'onyx' : 'dark');
+    // Onyx's glow and grain, or a plain background (background: solid).
+    this.setAttribute('bg', String(this._config.background || '').toLowerCase() === 'solid' ? 'solid' : 'glow');
+    // Tablet / large touchscreen: a wide layout with bigger buttons, as in Cyborg Cards.
+    this.setAttribute('view', /^(tablet|large|touch|touchscreen|wide)$/i.test(String(this._config.view || '').trim()) ? 'tablet' : 'phone');
     // Accept the 1.x shape (a list of {name, sensors}) as well as plain keys.
     this._cameraFilter = (this._config.cameras || [])
       .map((camera) => (typeof camera === 'string' ? camera : camera && camera.name))
@@ -180,6 +185,11 @@ class ReolinkClipsCard extends HTMLElement {
     this._eventType = this._config.default_event_type || 'all';
     this._render();
     if (this._hass) this._init();
+  }
+
+  /** Full width in the tablet / large touchscreen view (sections dashboards). */
+  getGridOptions() {
+    return this.getAttribute('view') === 'tablet' ? { columns: 'full', min_columns: 12, rows: 'auto' } : { columns: 12, min_columns: 6, rows: 'auto' };
   }
 
   getCardSize() {
@@ -1482,6 +1492,42 @@ class ReolinkClipsCard extends HTMLElement {
         --c-clay:  #A85A5D;
         --c-cache: #7A8D76;
       }
+      /* Onyx: the dark Weather Advisor look (the same as Cyborg Cards' onyx theme). */
+      :host([theme="onyx"]) {
+        --onyx:        #0D0C0B;
+        --card-bg:     rgba(8,10,18,.94);
+        --coffee-800:  #1E1C1A;
+        --taupe:       #C9B58E;
+        --taupe-soft:  #D6C7B3;
+        --on-accent:   #14110C;
+        --fg:          #ECE4D6;
+        --fg-dim:      #BDB09C;
+        --fg-muted:    #8A7E6D;
+        --line:        rgba(154,136,115,.20);
+        --line-strong: rgba(154,136,115,.35);
+        --glass:       rgba(255,255,255,.055);
+        --glass2:      rgba(255,255,255,.08);
+        --c-taupe: #BDB09C;
+        --c-sand:  #C9B58E;
+        --c-rust:  #B86B4A;
+        --c-moss:  #7A8D76;
+        --c-clay:  #A85A5D;
+        --c-cache: #7A8D76;
+        --radius-card: 26px;
+        font-family: "SF Pro Display", "SF Pro Text", "Helvetica Neue", system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      :host([theme="onyx"]) .card { box-shadow: 0 30px 70px -16px rgba(0,0,0,.7); }
+      :host([theme="onyx"]) .card::before {
+        inset: 0; height: auto; opacity: .28;
+        background:
+          radial-gradient(ellipse 140% 60% at 80% -20%, #1A237E 0%, transparent 70%),
+          radial-gradient(ellipse 100% 80% at -10% 110%, #1565C0 0%, transparent 65%);
+      }
+      :host([theme="onyx"]) .card::after {
+        content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none; opacity: .6;
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.75' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='200' height='200' filter='url(%23n)' opacity='.04'/%3E%3C/svg%3E");
+      }
+      :host([bg="solid"]) .card::before, :host([bg="solid"]) .card::after { display: none; }
       :host([theme="dark-neon"]) .card { border-color: rgba(6,182,212,.22); box-shadow: 0 0 0 1px rgba(6,182,212,.05), 0 0 26px -8px rgba(6,182,212,.35), 0 30px 70px -30px rgba(0,0,0,.9); }
 
       .card {
@@ -1749,6 +1795,51 @@ class ReolinkClipsCard extends HTMLElement {
       .player:fullscreen { border-radius: 0; border: 0; aspect-ratio: auto; }
       .player:fullscreen .fs-nav { display: flex; }
       .player:fullscreen .fullscreen-btn { opacity: .8; }
+
+      /* Tablet / large touchscreen view: bigger type and touch targets everywhere, and on a wide
+         card the player on the left with the date, filters and clips in a column on the right. */
+      :host([view="tablet"]) { container: rc / inline-size; }
+      :host([view="tablet"]) .card { padding: 20px 24px; gap: 14px; font-size: 15px; }
+      :host([view="tablet"]) .hue-icon { width: 52px; height: 52px; border-radius: 15px; }
+      :host([view="tablet"]) .title { font-size: 20px; }
+      :host([view="tablet"]) .subtitle { font-size: 14px; }
+      :host([view="tablet"]) .refresh-btn { height: 48px; padding: 0 18px; font-size: 14px; }
+      :host([view="tablet"]) .cam-tab { height: 52px; font-size: 14px; }
+      :host([view="tablet"]) .cam-tab ha-icon { --mdc-icon-size: 24px; }
+      :host([view="tablet"]) .dropdown-btn { min-height: 52px; font-size: 15px; }
+      :host([view="tablet"]) .event-chips { gap: 8px; min-height: 52px; }
+      :host([view="tablet"]) .event-chips > * { min-height: 44px; font-size: 14px; padding-left: 16px; padding-right: 16px; }
+      :host([view="tablet"]) .clips-nav { grid-template-columns: 56px 1fr 56px; }
+      :host([view="tablet"]) .nav-btn { width: 56px; height: 56px; }
+      :host([view="tablet"]) .nav-btn svg { width: 22px; height: 22px; }
+      :host([view="tablet"]) .clip-name { font-size: 17px; }
+      :host([view="tablet"]) .clip-index { font-size: 13.5px; }
+      :host([view="tablet"]) .thumb { width: 150px; height: 88px; }
+      :host([view="tablet"]) .thumb-time { font-size: 12px; padding: 3px 6px; }
+      :host([view="tablet"]) .clip-badge, :host([view="tablet"]) .cache-badge, :host([view="tablet"]) .clip-time-inner { font-size: 13px; padding: 5px 10px; }
+      :host([view="tablet"]) .clip-time-badge, :host([view="tablet"]) .player-cam-label { font-size: 13px; }
+      :host([view="tablet"]) .fullscreen-btn, :host([view="tablet"]) .mute-btn { width: 48px; height: 48px; }
+      :host([view="tablet"]) .mute-btn { right: 66px; }
+      :host([view="tablet"]) .fullscreen-btn svg, :host([view="tablet"]) .mute-btn svg { width: 22px; height: 22px; }
+      :host([view="tablet"]) .play-btn-icon { transform: scale(1.3); }
+      @container rc (min-width: 900px) {
+        .card {
+          display: grid; column-gap: 20px; row-gap: 14px; align-items: start;
+          grid-template-columns: minmax(0, 1fr) clamp(300px, 32%, 480px);
+          grid-template-rows: auto auto auto 1fr auto;
+          grid-template-areas: "header header" "tabs tabs" "player filters" "player strip" "nav strip";
+        }
+        .header { grid-area: header; }
+        .camera-tabs { grid-area: tabs; }
+        .filter-row { grid-area: filters; grid-template-columns: 1fr; }
+        .player { grid-area: player; }
+        .clips-nav { grid-area: nav; }
+        .filmstrip {
+          grid-area: strip; align-self: stretch; display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+          align-content: start; overflow-x: hidden; overflow-y: auto; max-height: 100%; scroll-snap-type: y proximity;
+        }
+        .filmstrip .thumb { width: auto; height: auto; aspect-ratio: 16 / 9.5; }
+      }
       .fs-nav-btn {
         width: 52px; height: 52px; background: rgba(0,0,0,.6);
         border: 1px solid rgba(255,255,255,.18); border-radius: 16px; cursor: pointer;
@@ -1796,8 +1887,17 @@ class ReolinkClipsCardEditor extends HTMLElement {
           { value: 'coffee', label: 'Coffee (warm)' },
           { value: 'dark-neon', label: 'Dark neon' },
           { value: 'soft-dark', label: 'Soft dark' },
+          { value: 'onyx', label: 'Onyx (Weather Advisor dark)' },
         ] } },
       },
+      {
+        name: 'view',
+        selector: { select: { mode: 'dropdown', options: [{ value: 'phone', label: 'Phone' }, { value: 'tablet', label: 'Tablet / large touchscreen' }] } },
+      },
+      ...(String(this._config?.theme || '').toLowerCase() === 'onyx' ? [{
+        name: 'background',
+        selector: { select: { mode: 'dropdown', options: [{ value: 'glow', label: 'Glow' }, { value: 'solid', label: 'Solid' }] } },
+      }] : []),
       { name: 'title', selector: { text: {} } },
       {
         name: 'cameras',
@@ -1868,6 +1968,8 @@ class ReolinkClipsCardEditor extends HTMLElement {
       this._form = document.createElement('ha-form');
       this._form.computeLabel = (schema) => ({
         theme: 'Theme',
+        background: 'Background',
+        view: 'View',
         title: 'Card title',
         cameras: 'Cameras (all if none selected)',
         default_event_type: 'Event type shown first',
@@ -1883,6 +1985,8 @@ class ReolinkClipsCardEditor extends HTMLElement {
         if (Object.keys(icons).length) config.camera_icons = icons; else delete config.camera_icons;
         if (config.tab_labels === 'auto') delete config.tab_labels;
         if (config.overlay === 'always') delete config.overlay;
+        if (config.background === 'glow' || config.theme !== 'onyx') delete config.background;
+        if (config.view === 'phone') delete config.view;
         this.dispatchEvent(new CustomEvent('config-changed', {
           detail: { config },
           bubbles: true, composed: true,
