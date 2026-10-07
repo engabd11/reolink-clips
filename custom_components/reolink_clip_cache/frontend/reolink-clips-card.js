@@ -16,7 +16,7 @@
  *   autoplay: false
  */
 
-const CARD_VERSION = '2.3.5';
+const CARD_VERSION = '2.3.6';
 // How long Play waits for an uncached clip to be fetched into the cache.
 const CACHE_WAIT_MS = 300000;
 // Zoom limits for the player (pinch, wheel).
@@ -1011,7 +1011,8 @@ class ReolinkClipsCard extends HTMLElement {
       strip.innerHTML = '';
       return;
     }
-    strip.style.display = 'flex';
+    // No inline display here: the tablet view lays the list out as a vertical column.
+    strip.style.display = '';
 
     strip.innerHTML = this._clips.map((clip, index) => {
       const info = meta(clip.event_type);
@@ -1026,6 +1027,7 @@ class ReolinkClipsCard extends HTMLElement {
                 data-index="${index}" title="${info.label} ${time}">
                 ${inner}
                 <span class="thumb-time">${time}</span>
+                <span class="thumb-meta"><b>${info.label}</b><span>${time}${clip.duration ? ` · ${clip.duration}s` : ''}</span></span>
                 ${clip.cached ? '<span class="thumb-cached"></span>' : ''}
               </button>`;
     }).join('');
@@ -1033,8 +1035,16 @@ class ReolinkClipsCard extends HTMLElement {
     strip.querySelectorAll('.thumb').forEach((thumb) => {
       thumb.addEventListener('click', () => this._selectClip(Number(thumb.dataset.index)));
     });
+    // Scroll the list itself (sideways on a phone, down in the tablet view), never the page.
     const active = strip.querySelector('.thumb.active');
-    if (active) active.scrollIntoView({ block: 'nearest', inline: 'center', behavior: 'smooth' });
+    if (active) {
+      const s = strip.getBoundingClientRect(), a = active.getBoundingClientRect();
+      strip.scrollTo({
+        left: strip.scrollLeft + a.left - s.left - (s.width - a.width) / 2,
+        top: strip.scrollTop + a.top - s.top - (s.height - a.height) / 2,
+        behavior: 'smooth',
+      });
+    }
   }
 
   _refreshDetections(force = false) {
@@ -1783,6 +1793,7 @@ class ReolinkClipsCard extends HTMLElement {
         background: linear-gradient(transparent, rgba(0,0,0,.85));
         font-family: 'JetBrains Mono', monospace; letter-spacing: 0.2px;
       }
+      .thumb-meta { display: none; }
       .thumb-cached { position: absolute; top: 4px; right: 4px; width: 6px; height: 6px; border-radius: 50%; background: var(--c-cache); box-shadow: 0 0 0 2px rgba(0,0,0,.6); }
 
       .hint { position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); max-width: 90%; padding: 5px 10px; border-radius: 999px;
@@ -1834,11 +1845,22 @@ class ReolinkClipsCard extends HTMLElement {
         .filter-row { grid-area: filters; grid-template-columns: 1fr; }
         .player { grid-area: player; }
         .clips-nav { grid-area: nav; }
+        /* The clips as a vertical list beside the player, as tall as the player and its controls
+           (contain: size keeps a long day from stretching the card); it scrolls on its own. */
         .filmstrip {
-          grid-area: strip; align-self: stretch; display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
-          align-content: start; overflow-x: hidden; overflow-y: auto; max-height: 100%; scroll-snap-type: y proximity;
+          grid-area: strip; align-self: stretch; contain: size; display: flex; flex-direction: column; gap: 8px;
+          overflow-x: hidden; overflow-y: auto; padding: 2px 6px 2px 2px; scroll-snap-type: y proximity;
         }
-        .filmstrip .thumb { width: auto; height: auto; aspect-ratio: 16 / 9.5; }
+        :host([view="tablet"]) .filmstrip::-webkit-scrollbar { width: 5px; height: auto; }
+        :host([view="tablet"]) .filmstrip .thumb { flex: none; width: auto; height: 84px; display: grid; grid-template-columns: 142px minmax(0, 1fr); align-items: center; column-gap: 14px;
+          text-align: left; background: var(--glass); border-radius: 14px; scroll-snap-align: start; font: inherit; }
+        :host([view="tablet"]) .filmstrip .thumb:hover { transform: none; background: var(--glass2); }
+        :host([view="tablet"]) .filmstrip .thumb img, :host([view="tablet"]) .filmstrip .thumb-fallback { width: 142px; height: 84px; }
+        :host([view="tablet"]) .filmstrip .thumb-time { display: none; }
+        :host([view="tablet"]) .filmstrip .thumb-meta { display: flex; flex-direction: column; gap: 5px; min-width: 0; padding-right: 22px; }
+        :host([view="tablet"]) .filmstrip .thumb-meta b { font-size: 16px; font-weight: 700; color: currentColor; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        :host([view="tablet"]) .filmstrip .thumb-meta span { font-size: 14px; color: var(--fg-dim); font-family: 'JetBrains Mono', monospace; font-variant-numeric: tabular-nums; white-space: nowrap; }
+        :host([view="tablet"]) .filmstrip .thumb-cached { top: 50%; right: 12px; width: 8px; height: 8px; margin-top: -4px; }
       }
       .fs-nav-btn {
         width: 52px; height: 52px; background: rgba(0,0,0,.6);

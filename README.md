@@ -98,7 +98,7 @@ camera_icons:                   # optional: your own icon per camera
 |---|---|---|
 | `theme` | `dark` | `dark` is the CAMusic OLED look, `coffee` the warm espresso look, `dark-neon` the blue-black glass with cyan glow, `soft-dark` neutral black with cream text and muted earth colours, `onyx` the dark Weather Advisor look (navy onyx glass, taupe, sand and moss), matching [Cyborg Cards](https://github.com/engabd11/cyborg-cards) |
 | `background` | `glow` | Onyx only: `glow` keeps its soft glow and grain, `solid` turns them off |
-| `view` | `phone` | `tablet` for wall and kitchen touchscreens: bigger buttons and text, and on a wide card the player on the left with the date, filters and clips beside it |
+| `view` | `phone` | `tablet` for wall and kitchen touchscreens: bigger buttons and text, and on a wide card the player on the left with the date, filters and a scrolling list of the clips (thumbnail, event, time and length) beside it |
 | `title` | `Events` | Card heading |
 | `cameras` | all | Camera keys to show, in tab order. Camera names also work. |
 | `default_event_type` | `all` | Filter selected when the card loads |
