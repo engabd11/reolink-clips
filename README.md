@@ -81,7 +81,8 @@ Everything is optional; the defaults work.
 
 ```yaml
 type: custom:reolink-clips-card
-theme: dark                     # dark | coffee | dark-neon | soft-dark
+theme: dark                     # dark | coffee | dark-neon | soft-dark | onyx
+view: phone                     # phone | tablet (large touchscreens)
 title: Events
 cameras: [carport, back_door]   # omit for every discovered camera
 default_event_type: all         # all | person | vehicle | animal | package | visitor (doorbell)
@@ -95,7 +96,9 @@ camera_icons:                   # optional: your own icon per camera
 
 | Option | Default | Description |
 |---|---|---|
-| `theme` | `dark` | `dark` is the CAMusic OLED look, `coffee` the warm espresso look, `dark-neon` the blue-black glass with cyan glow, `soft-dark` neutral black with cream text and muted earth colours, matching [Cyborg Cards](https://github.com/engabd11/cyborg-cards) |
+| `theme` | `dark` | `dark` is the CAMusic OLED look, `coffee` the warm espresso look, `dark-neon` the blue-black glass with cyan glow, `soft-dark` neutral black with cream text and muted earth colours, `onyx` the dark Weather Advisor look (navy onyx glass, taupe, sand and moss), matching [Cyborg Cards](https://github.com/engabd11/cyborg-cards) |
+| `background` | `glow` | Onyx only: `glow` keeps its soft glow and grain, `solid` turns them off |
+| `view` | `phone` | `tablet` for wall and kitchen touchscreens: bigger buttons and text, and on a wide card the player on the left with the date, filters and clips beside it |
 | `title` | `Events` | Card heading |
 | `cameras` | all | Camera keys to show, in tab order. Camera names also work. |
 | `default_event_type` | `all` | Filter selected when the card loads |
