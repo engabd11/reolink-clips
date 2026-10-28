@@ -240,6 +240,12 @@ def bare_identifier(media_content_id: str) -> str:
     return value
 
 
+def file_parts(media_content_id: str) -> list[str] | None:
+    """Split a ``FILE|entry|channel|stream|name|start|end`` id, or None if it is not one."""
+    parts = bare_identifier(media_content_id).split("|", 6)
+    return parts if len(parts) == 7 and parts[0] == "FILE" else None
+
+
 def media_uri(identifier: str) -> str:
     """Return the browsable media source URI for a Reolink identifier."""
     if identifier.startswith(MEDIA_SOURCE_PREFIX):
@@ -577,9 +583,14 @@ class ReolinkClipCacheCoordinator:
         if cancel := self._pending_sweeps.pop(camera_key, None):
             cancel()
 
-        async def _run(_now: datetime) -> None:
+        @callback
+        def _run(_now: datetime) -> None:
             self._pending_sweeps.pop(camera_key, None)
-            await self.async_sweep_event(camera_key)
+            self.entry.async_create_background_task(
+                self.hass,
+                self.async_sweep_event(camera_key),
+                f"{STORAGE_DIR_NAME}_event_{camera_key}",
+            )
 
         self._pending_sweeps[camera_key] = async_call_later(
             self.hass, EVENT_SETTLE_DELAY, _run
@@ -587,9 +598,13 @@ class ReolinkClipCacheCoordinator:
 
     # ── Sweeping ───────────────────────────────────────────────────────
 
-    async def _async_interval_sweep(self, _now: datetime) -> None:
+    @callback
+    def _async_interval_sweep(self, _now: datetime) -> None:
         """Periodic sweep of every camera for today."""
-        await self.async_sweep()
+        # An entry task, so unloading the entry cancels a sweep part way through.
+        self.entry.async_create_background_task(
+            self.hass, self.async_sweep(), f"{STORAGE_DIR_NAME}_sweep"
+        )
 
     async def _async_interval_purge(self, _now: datetime) -> None:
         """Periodic retention enforcement."""
@@ -612,10 +627,15 @@ class ReolinkClipCacheCoordinator:
         if not self._cameras:
             await self.async_discover()
 
+        if camera_key and camera_key not in self._cameras:
+            _LOGGER.warning(
+                "No camera %s to sweep; cameras are %s",
+                camera_key,
+                ", ".join(sorted(self._cameras)) or "none",
+            )
+            return 0
         targets = (
-            [self._cameras[camera_key]]
-            if camera_key and camera_key in self._cameras
-            else list(self._cameras.values())
+            [self._cameras[camera_key]] if camera_key else list(self._cameras.values())
         )
         if days is None:
             days = [dt_util.now().date()]
@@ -627,6 +647,7 @@ class ReolinkClipCacheCoordinator:
                     cached += await self._async_sweep_camera(camera, day, force)
 
         if cached:
+            await self.async_purge()
             self._schedule_save()
             async_dispatcher_send(self.hass, SIGNAL_INDEX_UPDATED)
         return cached
@@ -668,8 +689,7 @@ class ReolinkClipCacheCoordinator:
             pending = [
                 descriptor
                 for descriptor in descriptors
-                if not self._is_cached(descriptor["clip_id"])
-                and self._clip_failures.get(descriptor["clip_id"], 0) < CLIP_FAILURE_LIMIT
+                if self._needs_fetch(descriptor["clip_id"])
             ][:EVENT_FETCH_LIMIT]
             for descriptor in pending:
                 if self._shutdown:
@@ -683,6 +703,7 @@ class ReolinkClipCacheCoordinator:
                     _LOGGER.exception("Unexpected error caching a clip")
 
         if cached:
+            await self.async_purge()
             self._schedule_save()
             async_dispatcher_send(self.hass, SIGNAL_INDEX_UPDATED)
         return cached
@@ -715,11 +736,7 @@ class ReolinkClipCacheCoordinator:
         pending = [
             descriptor
             for descriptor in descriptors
-            if not self._is_cached(descriptor["clip_id"])
-            and (
-                force
-                or self._clip_failures.get(descriptor["clip_id"], 0) < CLIP_FAILURE_LIMIT
-            )
+            if self._needs_fetch(descriptor["clip_id"], force)
         ]
         if not pending:
             return 0
@@ -881,8 +898,7 @@ class ReolinkClipCacheCoordinator:
         instead of guessing from when the download happened to run.
         """
         media_content_id = child.media_content_id or ""
-        parts = bare_identifier(media_content_id).split("|", 6)
-        if len(parts) != 7 or parts[0] != "FILE":
+        if (parts := file_parts(media_content_id)) is None:
             return None
 
         filename, start_id, end_id = parts[4], parts[5], parts[6]
@@ -931,6 +947,17 @@ class ReolinkClipCacheCoordinator:
         """Return True if the clip is already held locally."""
         record = self._index.get(clip_id)
         return bool(record and record.get("cached_at"))
+
+    def _needs_fetch(self, clip_id: str, force: bool = False) -> bool:
+        """Whether a sweep should download a clip.
+
+        Not one already cached, nor one purge evicted to keep the cache under
+        its size limit (fetching it again would push the cache straight back
+        over). ``force`` retries clips that failed too often.
+        """
+        if self._is_cached(clip_id) or (self._index.get(clip_id) or {}).get("evicted"):
+            return False
+        return force or self._clip_failures.get(clip_id, 0) < CLIP_FAILURE_LIMIT
 
     async def _async_cache_clip(self, descriptor: dict[str, Any]) -> bool:
         """Download, faststart and thumbnail one clip.
@@ -1045,8 +1072,8 @@ class ReolinkClipCacheCoordinator:
         nvr_download = [r for r in DIRECT_ROUTES if split_route(r)[0] == "NVR_DOWNLOAD"]
         others = [r for r in DIRECT_ROUTES if r not in nvr_download]
         routes = ["LIBRARY", NATIVE_FLV, *nvr_download, NATIVE_DOWNLOAD, *others, "PROXY"]
-        entry_id = bare_identifier(descriptor["media_content_id"]).split("|", 2)[1:2]
-        known = self._known_route(entry_id[0] if entry_id else "", self._camera_marker(descriptor))
+        parts = file_parts(descriptor["media_content_id"])
+        known = self._known_route(parts[1] if parts else "", descriptor.get("camera"))
         if known in routes:
             routes.remove(known)
             routes.insert(0, known)
@@ -1098,8 +1125,7 @@ class ReolinkClipCacheCoordinator:
 
     def _host_api(self, descriptor: dict[str, Any]) -> Any | None:
         """Return the Reolink integration's API object for a clip, if loaded."""
-        parts = bare_identifier(descriptor["media_content_id"]).split("|", 6)
-        if len(parts) != 7 or parts[0] != "FILE":
+        if (parts := file_parts(descriptor["media_content_id"])) is None:
             return None
         try:
             from homeassistant.components.reolink.util import get_host
@@ -1115,8 +1141,7 @@ class ReolinkClipCacheCoordinator:
 
         ``max_bytes`` stops early (used by diagnose). Returns bytes written.
         """
-        parts = bare_identifier(descriptor["media_content_id"]).split("|", 6)
-        if len(parts) != 7 or parts[0] != "FILE":
+        if (parts := file_parts(descriptor["media_content_id"])) is None:
             self._last_error = "not a Reolink recording id"
             return 0
         _, _entry_id, channel, stream, filename, start_id, end_id = parts
@@ -1204,19 +1229,21 @@ class ReolinkClipCacheCoordinator:
         if not written and self._last_status == 401:
             # The login token in the URL went stale (Home Assistant renews its
             # session now and then). Renew it and ask once more.
-            if (api := self._host_api(descriptor)) is not None:
-                try:
-                    await api.expire_session(unsubscribe=False)
-                except Exception:  # noqa: BLE001
-                    pass
-                if url := await self._async_direct_source(
-                    descriptor, request_type, plain_http, name
-                ):
-                    await self.hass.async_add_executor_job(_unlink, dest)
-                    written = await self._async_download(
-                        url, dest, headers=DIRECT_HEADERS, label=self._route_label(route)
-                    )
+            await self._async_renew_login(descriptor)
+            if url := await self._async_direct_source(
+                descriptor, request_type, plain_http, name
+            ):
+                await self.hass.async_add_executor_job(_unlink, dest)
+                written = await self._async_download(
+                    url, dest, headers=DIRECT_HEADERS, label=self._route_label(route)
+                )
         return written
+
+    async def _async_renew_login(self, descriptor: dict[str, Any]) -> None:
+        """Drop the Reolink login so the next URL carries a fresh token."""
+        if (api := self._host_api(descriptor)) is not None:
+            with contextlib.suppress(Exception):
+                await api.expire_session(unsubscribe=False)
 
     async def _async_segment_clip(
         self, descriptor: dict[str, Any], native: dict[str, Any], dest: Path
@@ -1260,7 +1287,8 @@ class ReolinkClipCacheCoordinator:
         A copy is reused for the segment's other clips, unless it was fetched
         before this clip ended (the hour may still have been recording).
         """
-        parts = bare_identifier(descriptor["media_content_id"]).split("|", 6)
+        # The caller found the native file, so this is a FILE id.
+        parts = file_parts(descriptor["media_content_id"])
         entry_id, channel, stream, end_id = parts[1], parts[2], parts[3], parts[6]
         key = f"{entry_id}|{channel}|{stream}|{native['name']}"
         clip_end = _parse_reolink_time(end_id)
@@ -1291,11 +1319,7 @@ class ReolinkClipCacheCoordinator:
             if written or self._last_status != 401 or attempt:
                 break
             # A stale login token: renew it and ask once more.
-            if (api := self._host_api(descriptor)) is not None:
-                try:
-                    await api.expire_session(unsubscribe=False)
-                except Exception:  # noqa: BLE001
-                    pass
+            await self._async_renew_login(descriptor)
         if not written:
             await self.hass.async_add_executor_job(_unlink, part)
             return None
@@ -1322,8 +1346,7 @@ class ReolinkClipCacheCoordinator:
         Returns the segment's name and the clip's offset into it in seconds,
         or None (with _last_error set) when the NVR's Search does not name one.
         """
-        parts = bare_identifier(descriptor["media_content_id"]).split("|", 6)
-        if len(parts) != 7 or parts[0] != "FILE":
+        if (parts := file_parts(descriptor["media_content_id"])) is None:
             self._last_error = "not a Reolink recording id"
             return None
         _, entry_id, channel, stream, _filename, start_id, end_id = parts
@@ -1389,19 +1412,13 @@ class ReolinkClipCacheCoordinator:
     @staticmethod
     def _clip_seconds(descriptor: dict[str, Any]) -> int | None:
         """Return a clip's length from the start and end in its id."""
-        parts = bare_identifier(descriptor["media_content_id"]).split("|", 6)
-        if len(parts) != 7:
+        if (parts := file_parts(descriptor["media_content_id"])) is None:
             return None
         start = _parse_reolink_time(parts[5])
         end = _parse_reolink_time(parts[6])
         if start is None or end is None or end <= start:
             return None
         return int((end - start).total_seconds())
-
-    @staticmethod
-    def _camera_marker(descriptor: dict[str, Any]) -> str:
-        """Return a per-camera key for remembering what works."""
-        return f"{descriptor.get('camera')}"
 
     async def _async_direct_source(
         self,
@@ -1417,8 +1434,7 @@ class ReolinkClipCacheCoordinator:
         request type does not apply, or anything else does not line up - the
         proxy remains as the fallback.
         """
-        parts = bare_identifier(descriptor["media_content_id"]).split("|", 6)
-        if len(parts) != 7 or parts[0] != "FILE":
+        if (parts := file_parts(descriptor["media_content_id"])) is None:
             return None
         _, entry_id, channel, stream, filename, start_id, end_id = parts
         if file_name:
@@ -1463,7 +1479,7 @@ class ReolinkClipCacheCoordinator:
         Each failed route is logged at debug level; a clip that cannot be
         fetched at all gets one warning listing what every route said.
         """
-        marker = self._camera_marker(descriptor)
+        marker = str(descriptor.get("camera"))
         reasons: dict[str, str] = {}
         for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
             for route in self._route_order(descriptor):
@@ -1550,6 +1566,9 @@ class ReolinkClipCacheCoordinator:
                     finally:
                         await self.hass.async_add_executor_job(handle.close)
         except TimeoutError:
+            if deadline is not None and written:
+                # A playback stream that went quiet still delivered a clip.
+                return written
             self._last_error = f"timed out after {limit:.0f}s"
             return 0
         except ClientError as err:
@@ -1646,8 +1665,13 @@ class ReolinkClipCacheCoordinator:
                 _, stderr = await proc.communicate()
         except TimeoutError:
             proc.kill()
+            await proc.wait()
             _LOGGER.warning("ffmpeg timed out")
             return False
+        except asyncio.CancelledError:
+            # An unloaded entry must not leave ffmpeg writing into the cache.
+            proc.kill()
+            raise
 
         if proc.returncode != 0:
             _LOGGER.debug("ffmpeg failed: %s", stderr.decode()[-300:])
@@ -1714,44 +1738,57 @@ class ReolinkClipCacheCoordinator:
     # ── Retention ──────────────────────────────────────────────────────
 
     async def async_purge(self) -> int:
-        """Enforce the age and size limits. Returns the clips removed."""
+        """Enforce the age and size limits. Returns the clips removed.
+
+        A clip evicted for size leaves an ``evicted`` marker in the index so
+        sweeps do not fetch it again; the age limit drops the marker later.
+        """
         cutoff = dt_util.utcnow() - timedelta(days=self.cache_days)
         records = sorted(
             self._index.items(), key=lambda item: item[1].get("start") or ""
         )
 
-        doomed: list[str] = []
+        expired: set[str] = set()
         total = 0
         for clip_id, record in records:
             start = dt_util.parse_datetime(record.get("start") or "")
             if start is not None and start < cutoff:
-                doomed.append(clip_id)
+                expired.add(clip_id)
             else:
                 total += int(record.get("size") or 0)
 
         # Then oldest-first until the cache fits inside its ceiling.
         ceiling = self.max_cache_bytes
+        evicted: set[str] = set()
         for clip_id, record in records:
             if total <= ceiling:
                 break
-            if clip_id in doomed:
+            if clip_id in expired or not record.get("cached_at"):
                 continue
-            doomed.append(clip_id)
+            evicted.add(clip_id)
             total -= int(record.get("size") or 0)
 
-        if not doomed:
+        if not expired and not evicted:
             return 0
 
-        for clip_id in doomed:
+        removed = len(evicted) + sum(
+            1 for clip_id in expired if self._index[clip_id].get("cached_at")
+        )
+        for clip_id in expired:
             self._index.pop(clip_id, None)
+        for clip_id in evicted:
+            self._index[clip_id] = {
+                "start": self._index[clip_id].get("start"),
+                "evicted": True,
+            }
         await self.hass.async_add_executor_job(
-            _remove_ids, self._clips_dir, self._thumbs_dir, set(doomed)
+            _remove_ids, self._clips_dir, self._thumbs_dir, expired | evicted
         )
 
-        _LOGGER.info("Purged %d cached clip(s)", len(doomed))
+        _LOGGER.info("Purged %d cached clip(s)", removed)
         self._schedule_save()
         async_dispatcher_send(self.hass, SIGNAL_INDEX_UPDATED)
-        return len(doomed)
+        return removed
 
     async def async_clear(self) -> int:
         """Delete every cached clip, thumbnail and segment. Returns clips removed.
@@ -1895,16 +1932,8 @@ class ReolinkClipCacheCoordinator:
             f"{STORAGE_DIR_NAME}_on_demand_{clip_id}",
         )
 
-        parts = bare_identifier(media_content_id).split("|", 6)
-        if len(parts) == 7:
-            camera = next(
-                (
-                    item
-                    for item in self._cameras.values()
-                    if item.entry_id == parts[1] and item.channel == parts[2]
-                ),
-                None,
-            )
+        if parts := file_parts(media_content_id):
+            camera = self._camera_for(parts[1], parts[2])
             if self._needs_cache_to_play(parts[1], camera.key if camera else None):
                 # The card waits for the clip_cached event and plays it then.
                 return {"cached": False, "clip_id": clip_id, "url": None, "caching": True}
@@ -1920,6 +1949,17 @@ class ReolinkClipCacheCoordinator:
             "clip_id": clip_id,
             "url": self._signed_media_url(media.url, refresh_token_id),
         }
+
+    def _camera_for(self, entry_id: str, channel: str) -> CameraInfo | None:
+        """Return the discovered camera on a Reolink entry's channel."""
+        return next(
+            (
+                camera
+                for camera in self._cameras.values()
+                if camera.entry_id == entry_id and camera.channel == channel
+            ),
+            None,
+        )
 
     def _signed_media_url(self, url: str, refresh_token_id: str | None) -> str:
         """Sign a relative media source URL for the browser.
@@ -1948,19 +1988,9 @@ class ReolinkClipCacheCoordinator:
         which it refuses, so nothing is streaming and the cache is the only way
         the clip will play.
         """
-        parts = bare_identifier(media_content_id).split("|", 6)
-        if len(parts) != 7 or parts[0] != "FILE":
+        if (parts := file_parts(media_content_id)) is None:
             return
-
-        camera = next(
-            (
-                item
-                for item in self._cameras.values()
-                if item.entry_id == parts[1] and item.channel == parts[2]
-            ),
-            None,
-        )
-        if camera is None:
+        if (camera := self._camera_for(parts[1], parts[2])) is None:
             return
 
         if not self._needs_cache_to_play(camera.entry_id, camera.key):
@@ -2004,10 +2034,13 @@ class ReolinkClipCacheCoordinator:
         if not self._cameras:
             await self.async_discover()
 
+        if camera_key and camera_key not in self._cameras:
+            return {
+                "error": f"no camera {camera_key}; cameras are "
+                f"{', '.join(sorted(self._cameras)) or 'none'}"
+            }
         cameras = (
-            [self._cameras[camera_key]]
-            if camera_key and camera_key in self._cameras
-            else list(self._cameras.values())
+            [self._cameras[camera_key]] if camera_key else list(self._cameras.values())
         )
 
         report: dict[str, Any] = {

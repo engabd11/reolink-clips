@@ -127,7 +127,7 @@ camera_icons:                   # optional: your own icon per camera
 | Event types | Person, Vehicle, Animal | What to cache. **Doorbell press** is a doorbell's ring (Reolink's visitor event). Motion is not offered — it fires far too often to be worth caching. |
 | Stream | Low resolution | `sub` caches fast and small; `main` is the full-quality recording. **If every download fails, try the other one** — some NVRs will not serve downloads for one of the streams. |
 | Keep clips for | 7 days | Age limit |
-| Maximum cache size | 2048 MB | Size ceiling; oldest clips are evicted first |
+| Maximum cache size | 2048 MB | Size ceiling; oldest clips are evicted first. A clip evicted to make room is not fetched again by the sweep (it still plays from the NVR) |
 | Check for new clips every | 2 min | Sweep interval. A detection also triggers a check ~20 s after the event ends. |
 
 ## Services
