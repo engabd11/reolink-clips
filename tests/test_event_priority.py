@@ -46,6 +46,12 @@ def make() -> mod.ReolinkClipCacheCoordinator:
     coord._priority_idle.set()
     coord._is_cached = lambda _cid: False
     coord._schedule_save = lambda: None
+    coord._index = {}
+
+    async def no_purge():
+        return 0
+
+    coord.async_purge = no_purge
     return coord
 
 
@@ -120,6 +126,8 @@ async def main() -> None:
     # A detection schedules the event fetch, not a full sweep.
     coord = make()
     coord._pending_sweeps = {}
+    tasks: list = []
+    coord.entry = types.SimpleNamespace(async_create_background_task=lambda _h, coro, _n: tasks.append(coro))
     scheduled = {}
 
     def call_later(_hass, delay, action):
@@ -135,7 +143,8 @@ async def main() -> None:
 
     coord.async_sweep_event = fake_event
     coord._schedule_event_sweep("carport")
-    await scheduled["action"](None)
+    scheduled["action"](None)
+    await tasks[0]
     check("a detection runs the event fetch after the settle delay",
           ran == ["carport"] and scheduled["delay"] == mod.EVENT_SETTLE_DELAY, str(scheduled))
 

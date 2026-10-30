@@ -51,7 +51,6 @@ from .const import (
     SERVICE_PURGE_CACHE,
     SERVICE_REFRESH_CACHE,
     SERVICE_SWEEP_NOW,
-    VERSION,
 )
 from .coordinator import ReolinkClipCacheCoordinator
 from .http import async_register_views
@@ -168,14 +167,14 @@ async def _async_register_card(hass: HomeAssistant) -> None:
         _LOGGER.warning("Card file is missing at %s", card_path)
         return
 
-    # Cache-bust on the file's contents, not the version number, so browsers
+    # Cache-bust on the file's contents, so browsers
     # pick up a changed card even when the version was not bumped.
     digest = await hass.async_add_executor_job(_file_digest, card_path)
 
     await hass.http.async_register_static_paths(
         [StaticPathConfig(CARD_URL, str(card_path), True)]
     )
-    add_extra_js_url(hass, f"{CARD_URL}?v={VERSION}-{digest}")
+    add_extra_js_url(hass, f"{CARD_URL}?v={digest}")
     _LOGGER.debug("Registered dashboard card at %s", CARD_URL)
 
 

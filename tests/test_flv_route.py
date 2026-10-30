@@ -85,6 +85,15 @@ async def cut_off(request: web.Request) -> web.StreamResponse:
     return response
 
 
+async def quiet(request: web.Request) -> web.StreamResponse:
+    """A stream that stops sending but keeps the connection open."""
+    response = web.StreamResponse(headers={"Content-Type": "video/x-flv"})
+    await response.prepare(request)
+    await response.write(FLV_HEADER + b"\x00" * 8192)
+    await asyncio.sleep(3)
+    return response
+
+
 async def refused(_request: web.Request) -> web.Response:
     return web.Response(status=401, text="bad login for password=hunter2", content_type="text/html")
 
@@ -147,6 +156,7 @@ async def main() -> None:
     app.router.add_get("/endless", endless)
     app.router.add_get("/cut", cut_off)
     app.router.add_get("/refused", refused)
+    app.router.add_get("/quiet", quiet)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
@@ -165,6 +175,16 @@ async def main() -> None:
         coord = make(tmp)
         written = await coord._async_download(f"{base}/cut", tmp / "c.part", max_seconds=30)
         check("a stream the NVR drops keeps what arrived", written >= len(FLV_HEADER), f"{written} {coord._last_error}")
+
+        # Shrink the overall timeout so the stall is hit in a second, not 30.
+        real_timeout = asyncio.timeout
+        asyncio.timeout = lambda _seconds: real_timeout(1)
+        try:
+            coord = make(tmp)
+            written = await coord._async_download(f"{base}/quiet", tmp / "q.part", max_seconds=30)
+        finally:
+            asyncio.timeout = real_timeout
+        check("a stream that goes quiet keeps what arrived", written >= len(FLV_HEADER), f"{written} {coord._last_error}")
 
         coord = make(tmp)
         written = await coord._async_download(f"{base}/refused?user=admin&password=hunter2", tmp / "r.part")

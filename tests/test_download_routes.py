@@ -51,6 +51,7 @@ def make(tmp: pathlib.Path) -> mod.ReolinkClipCacheCoordinator:
     coord._priority_idle.set()
     coord._backoff = {}
     coord._clip_failures = {}
+    coord._index = {}
     coord._last_error = ""
     coord._last_status = None
     coord._root = tmp
