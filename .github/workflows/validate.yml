@@ -53,6 +53,8 @@ jobs:
         run: python tests/test_buttons.py
       - name: Check new events go ahead of a sweep
         run: python tests/test_event_priority.py
+      - name: Check retention and reconcile
+        run: python tests/test_retention.py
 
   syntax:
     name: Syntax

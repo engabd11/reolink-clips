@@ -182,7 +182,7 @@ OK_STATUSES: Final = (200, 206)
 # backfill still caches the most recent clips first and finishes over a few
 # sweeps instead of blocking everything else for minutes.
 MAX_CLIPS_PER_SWEEP: Final = 25
-DOWNLOAD_CHUNK_SIZE: Final = 64 * 1024
+DOWNLOAD_CHUNK_SIZE: Final = 1024 * 1024
 DOWNLOAD_TIMEOUT: Final = 180
 FFMPEG_TIMEOUT: Final = 60
 
