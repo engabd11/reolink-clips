@@ -49,6 +49,8 @@ def make(tmp: pathlib.Path, cache_days: int, max_mb: int) -> mod.ReolinkClipCach
     coord._thumbs_dir.mkdir(parents=True, exist_ok=True)
     coord._index = {}
     coord._clip_failures = {}
+    coord._in_flight = set()
+    coord._segments = {}
     coord._schedule_save = lambda: None
     return coord
 
@@ -105,6 +107,12 @@ async def main() -> None:
     check("reconcile drops an entry whose file is gone", "gone" not in coord._index and "kept" in coord._index)
     check("and deletes a file the index does not know", files(coord) == {"kept"}, str(files(coord)))
     check("and keeps eviction markers", "marker" in coord._index)
+
+    # A clip still being saved has a file but no index entry yet.
+    (coord._clips_dir / "saving.mp4").write_bytes(b"x")
+    coord._in_flight = {"saving"}
+    await coord.async_reconcile()
+    check("reconcile leaves a clip that is still being saved", "saving" in files(coord), str(files(coord)))
 
     # A camera that does not exist sweeps nothing.
     coord = make(pathlib.Path(tempfile.mkdtemp()), cache_days=7, max_mb=100)

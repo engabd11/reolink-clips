@@ -991,7 +991,7 @@ class ReolinkClipsCard extends HTMLElement {
         ? this._allClips.length
         : this._allClips.filter((clip) => (clip.event_types || []).includes(type)).length;
       return `<button class="evt-chip ${info.color} ${this._eventType === type ? 'active' : ''}"
-                data-type="${type}"><span class="evt-dot"></span>${info.label}
+                data-type="${esc(type)}"><span class="evt-dot"></span>${info.label}
                 <span class="evt-count">${count}</span></button>`;
     }).join('');
 

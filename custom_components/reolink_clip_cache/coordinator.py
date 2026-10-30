@@ -264,12 +264,6 @@ def clip_id_for(media_content_id: str) -> str:
     return hashlib.sha1(identifier).hexdigest()[:16]
 
 
-def _local_tz():
-    """Return HA's configured timezone across HA versions."""
-    getter = getattr(dt_util, "get_default_time_zone", None)
-    return getter() if getter else dt_util.DEFAULT_TIME_ZONE
-
-
 def _parse_reolink_time(value: str) -> datetime | None:
     """Parse a Reolink ``YYYYMMDDHHMMSS`` time id into an aware datetime.
 
@@ -280,7 +274,7 @@ def _parse_reolink_time(value: str) -> datetime | None:
         naive = datetime.strptime(value, "%Y%m%d%H%M%S")
     except (ValueError, TypeError):
         return None
-    return naive.replace(tzinfo=_local_tz())
+    return naive.replace(tzinfo=dt_util.get_default_time_zone())
 
 
 def normalise_trigger(trigger: str) -> str:
@@ -1202,7 +1196,7 @@ class ReolinkClipCacheCoordinator:
             if source is None:
                 self._last_error = "the clip could not be resolved"
                 return 0
-            return await self._async_download(source, dest, label=self._route_label(route))
+            return await self._async_download(source, dest)
 
         native: dict[str, Any] | None = None
         if route in NATIVE_ROUTES:
@@ -1224,7 +1218,7 @@ class ReolinkClipCacheCoordinator:
                 url = with_seek(url, native["offset"])
             return await self._async_flv_download(url, descriptor, dest)
         written = await self._async_download(
-            url, dest, headers=DIRECT_HEADERS, label=self._route_label(route)
+            url, dest, headers=DIRECT_HEADERS
         )
         if not written and self._last_status == 401:
             # The login token in the URL went stale (Home Assistant renews its
@@ -1235,7 +1229,7 @@ class ReolinkClipCacheCoordinator:
             ):
                 await self.hass.async_add_executor_job(_unlink, dest)
                 written = await self._async_download(
-                    url, dest, headers=DIRECT_HEADERS, label=self._route_label(route)
+                    url, dest, headers=DIRECT_HEADERS
                 )
         return written
 
@@ -1304,7 +1298,6 @@ class ReolinkClipCacheCoordinator:
         await self._async_prune_segments()
         path = self._segments_dir / f"{hashlib.sha1(key.encode()).hexdigest()[:16]}.mp4"
         part = path.with_suffix(".part")
-        label = self._route_label(NATIVE_DOWNLOAD)
         fetched = dt_util.now()
         written = 0
         for attempt in range(2):
@@ -1314,7 +1307,7 @@ class ReolinkClipCacheCoordinator:
                 return None
             self._last_status = None
             written = await self._async_download(
-                url, part, headers=DIRECT_HEADERS, label=label, timeout=NATIVE_DOWNLOAD_TIMEOUT
+                url, part, headers=DIRECT_HEADERS, timeout=NATIVE_DOWNLOAD_TIMEOUT
             )
             if written or self._last_status != 401 or attempt:
                 break
@@ -1395,7 +1388,6 @@ class ReolinkClipCacheCoordinator:
             url,
             dest,
             headers=DIRECT_HEADERS,
-            label=self._route_label("FLV"),
             max_seconds=listen,
         )
         if not written:
@@ -1521,7 +1513,6 @@ class ReolinkClipCacheCoordinator:
         url: str,
         dest: Path,
         headers: dict[str, str] | None = None,
-        label: str = "the Home Assistant proxy",
         max_seconds: float | None = None,
         timeout: float | None = None,
     ) -> int:
@@ -1720,7 +1711,7 @@ class ReolinkClipCacheCoordinator:
         for clip_id in missing:
             self._index.pop(clip_id, None)
 
-        orphans = on_disk - clip_ids
+        orphans = on_disk - clip_ids - self._in_flight
         if orphans:
             await self.hass.async_add_executor_job(
                 _remove_ids, self._clips_dir, self._thumbs_dir, orphans
@@ -1743,6 +1734,9 @@ class ReolinkClipCacheCoordinator:
         A clip evicted for size leaves an ``evicted`` marker in the index so
         sweeps do not fetch it again; the age limit drops the marker later.
         """
+        # Not while a clip is being cut from a segment.
+        if not self._in_flight:
+            await self._async_prune_segments()
         cutoff = dt_util.utcnow() - timedelta(days=self.cache_days)
         records = sorted(
             self._index.items(), key=lambda item: item[1].get("start") or ""
