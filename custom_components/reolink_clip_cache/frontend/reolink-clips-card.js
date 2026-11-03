@@ -16,7 +16,7 @@
  *   autoplay: false
  */
 
-const CARD_VERSION = '2.3.7';
+const CARD_VERSION = '2.3.8';
 // How long Play waits for an uncached clip to be fetched into the cache.
 const CACHE_WAIT_MS = 300000;
 // Zoom limits for the player (pinch, wheel).
@@ -209,6 +209,9 @@ class ReolinkClipsCard extends HTMLElement {
     if (this._hass && this._ready) {
       this._subscribe();
       this._startDetectionTicker();
+      // Back on a dashboard view (HA reattaches the card without the tab ever hiding): a list older than
+      // STALE_MS is fetched again, or its thumbnails would load with expired signed links.
+      if (Date.now() - this._lastLoad > STALE_MS) this._checkCameras();
     }
   }
 
